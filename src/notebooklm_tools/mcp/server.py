@@ -23,7 +23,7 @@ import os
 
 from fastmcp import FastMCP
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 
 from notebooklm_tools import __version__
 
@@ -92,6 +92,56 @@ def _register_tools():
 _register_tools()
 
 
+def _setup_oauth(server: FastMCP, client_id: str, client_secret: str,
+                 server_url: str, mcp_path: str):
+    """Register OAuth 2.1 endpoints and return middleware for HTTP transport.
+
+    Returns (OAuthProvider, Middleware) tuple for use with mcp.run().
+    """
+    from starlette.middleware import Middleware
+    from .oauth import OAuthProvider, OAuthMiddleware
+
+    provider = OAuthProvider(
+        client_id=client_id,
+        client_secret=client_secret,
+        server_url=server_url,
+        mcp_path=mcp_path,
+    )
+
+    @server.custom_route("/.well-known/oauth-authorization-server", methods=["GET"])
+    async def oauth_as_metadata(request: Request) -> JSONResponse:
+        return JSONResponse(provider.authorization_server_metadata())
+
+    @server.custom_route("/.well-known/oauth-protected-resource", methods=["GET"])
+    async def oauth_resource_metadata(request: Request) -> JSONResponse:
+        # RFC 9728: path-aware discovery — client may request
+        # /.well-known/oauth-protected-resource/sse (or /mcp, etc.)
+        # Starlette exact-match routes won't catch the suffix, so we
+        # check the raw path here and serve metadata for any sub-path.
+        return JSONResponse(provider.protected_resource_metadata())
+
+    # RFC 9728 path-aware discovery: register the path-specific route
+    # e.g. /.well-known/oauth-protected-resource/sse
+    well_known_path = f"/.well-known/oauth-protected-resource{mcp_path}"
+    if well_known_path != "/.well-known/oauth-protected-resource":
+        @server.custom_route(well_known_path, methods=["GET"])
+        async def oauth_resource_metadata_path(request: Request) -> JSONResponse:
+            return JSONResponse(provider.protected_resource_metadata())
+
+    @server.custom_route("/oauth/authorize", methods=["GET"])
+    async def oauth_authorize(request: Request) -> Response:
+        return provider.handle_authorize(dict(request.query_params))
+
+    @server.custom_route("/oauth/token", methods=["POST"])
+    async def oauth_token(request: Request) -> JSONResponse:
+        form_data = await request.form()
+        return provider.handle_token(dict(form_data))
+
+    middleware = Middleware(OAuthMiddleware, provider=provider)
+    mcp_logger.info("OAuth 2.1 enabled — client_id=%s server_url=%s", client_id, server_url)
+    return provider, middleware
+
+
 def main():
     """Run the MCP server.
 
@@ -114,11 +164,17 @@ Environment Variables:
   NOTEBOOKLM_HL                Interface language and default artifact language (default: en)
   NOTEBOOKLM_QUERY_TIMEOUT     Query timeout in seconds (default: 120.0)
 
+OAuth (for remote MCP on claude.ai):
+  NOTEBOOKLM_OAUTH_CLIENT_ID      OAuth Client ID
+  NOTEBOOKLM_OAUTH_CLIENT_SECRET  OAuth Client Secret
+  NOTEBOOKLM_OAUTH_SERVER_URL     Public HTTPS base URL of this server
+
 Examples:
   notebooklm-mcp                              # Default stdio transport
   notebooklm-mcp --transport http             # HTTP on localhost:8000
   notebooklm-mcp --transport http --port 3000 # HTTP on custom port
   notebooklm-mcp --debug                      # Enable debug logging
+  notebooklm-mcp --transport http --oauth-client-id MY_ID --oauth-client-secret MY_SECRET --oauth-server-url https://my-server.example.com
         """,
     )
 
@@ -166,6 +222,23 @@ Examples:
         help="Query timeout in seconds (default: 120.0)",
     )
 
+    # OAuth arguments (for remote MCP / claude.ai integration)
+    parser.add_argument(
+        "--oauth-client-id",
+        default=os.environ.get("NOTEBOOKLM_OAUTH_CLIENT_ID"),
+        help="OAuth Client ID (also: NOTEBOOKLM_OAUTH_CLIENT_ID)",
+    )
+    parser.add_argument(
+        "--oauth-client-secret",
+        default=os.environ.get("NOTEBOOKLM_OAUTH_CLIENT_SECRET"),
+        help="OAuth Client Secret (also: NOTEBOOKLM_OAUTH_CLIENT_SECRET)",
+    )
+    parser.add_argument(
+        "--oauth-server-url",
+        default=os.environ.get("NOTEBOOKLM_OAUTH_SERVER_URL"),
+        help="Public HTTPS base URL of this server (also: NOTEBOOKLM_OAUTH_SERVER_URL)",
+    )
+
     args = parser.parse_args()
 
     # Configure debug logging
@@ -182,6 +255,24 @@ Examples:
 
     set_query_timeout(args.query_timeout)
 
+    # Set up OAuth if configured (HTTP transport only)
+    oauth_middleware = []
+    if args.oauth_client_id and args.oauth_client_secret:
+        if args.transport not in ("http", "sse"):
+            parser.error("OAuth requires --transport http or sse")
+        if not args.oauth_server_url:
+            parser.error("--oauth-server-url is required when OAuth is enabled")
+        # SSE transport uses /sse as endpoint, not the --path value
+        resource_path = "/sse" if args.transport == "sse" else args.path
+        _, middleware = _setup_oauth(
+            mcp,
+            client_id=args.oauth_client_id,
+            client_secret=args.oauth_client_secret,
+            server_url=args.oauth_server_url,
+            mcp_path=resource_path,
+        )
+        oauth_middleware.append(middleware)
+
     # Run server with appropriate transport
     # show_banner=False prevents Rich box-drawing output that can corrupt
     # the JSON-RPC protocol on Windows (especially with non-English locales)
@@ -194,6 +285,7 @@ Examples:
             port=args.port,
             path=args.path,
             stateless_http=args.stateless,
+            middleware=oauth_middleware or None,
             show_banner=False,
         )
     elif args.transport == "sse":
@@ -201,6 +293,7 @@ Examples:
             transport="sse",
             host=args.host,
             port=args.port,
+            middleware=oauth_middleware or None,
             show_banner=False,
         )
 

@@ -1,6 +1,6 @@
 """NotebookLM Tools - Unified CLI and MCP server for Google NotebookLM."""
 
-__version__ = "0.5.11"
+__version__ = "0.6.1"
 
 from notebooklm_tools.core.client import NotebookLMClient
 
