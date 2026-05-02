@@ -665,8 +665,12 @@ def find_or_create_notebooklm_page_by_cdp_url(cdp_http_url: str) -> dict | None:
         )
         if response.status_code == 200 and response.text.strip():
             return response.json()
+        _logger.debug("Failed to create page via PUT /json/new?url: HTTP %s", response.status_code)
+    except Exception as e:
+        _logger.debug("Exception creating page via PUT /json/new?url: %s", e)
 
-        # Fallback: create blank page then navigate
+    # Fallback 1: create blank page then navigate
+    try:
         response = httpx_client.put(f"{cdp_http_url}/json/new", timeout=10)
         if response.status_code == 200 and response.text.strip():
             page = response.json()
@@ -674,10 +678,32 @@ def find_or_create_notebooklm_page_by_cdp_url(cdp_http_url: str) -> dict | None:
             if ws_url:
                 navigate_to_url(ws_url, NOTEBOOKLM_URL)
             return page
+        _logger.debug("Failed to create blank page via PUT /json/new: HTTP %s", response.status_code)
+    except Exception as e:
+        _logger.debug("Exception creating blank page via PUT /json/new: %s", e)
 
-        return None
-    except Exception:
-        return None
+    # Fallback 2: reuse an existing blank/new tab page
+    _logger.debug("Falling back to reusing an existing page.")
+    pages = get_pages_by_cdp_url(cdp_http_url)
+    for page in pages:
+        url = page.get("url", "")
+        if url in ("about:blank", "chrome://newtab/"):
+            ws_url = _normalize_ws_url(page.get("webSocketDebuggerUrl"))
+            if ws_url:
+                _logger.debug("Reusing page with url %s", url)
+                navigate_to_url(ws_url, NOTEBOOKLM_URL)
+                return page
+
+    # Fallback 3: reuse the very first page of type 'page'
+    for page in pages:
+        if page.get("type") == "page":
+            ws_url = _normalize_ws_url(page.get("webSocketDebuggerUrl"))
+            if ws_url:
+                _logger.debug("Reusing arbitrary page with url %s", page.get("url", ""))
+                navigate_to_url(ws_url, NOTEBOOKLM_URL)
+                return page
+
+    return None
 
 
 def find_or_create_notebooklm_page(port: int = CDP_DEFAULT_PORT) -> dict | None:
