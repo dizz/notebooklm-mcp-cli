@@ -1,72 +1,130 @@
 """Skill installer commands for NotebookLM CLI."""
 
+import os
 import re
 import shutil
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, TypedDict
 
 import typer
-from rich.console import Console
 from rich.table import Table
 
 from notebooklm_tools import __version__
+from notebooklm_tools.cli.utils import is_tool_on_system, make_console
 
-console = Console()
+console = make_console()
 app = typer.Typer(
     name="skill",
     help="Install NotebookLM skills for AI tools",
     no_args_is_help=True,
 )
 
-# Tool configuration mapping
-TOOL_CONFIGS = {
+_HOME = Path.home()
+
+# Shared paths: agents, gemini-cli, codex, and antigravity (project) all install here
+_AGENTS_USER = _HOME / ".agents" / "skills" / "nlm-skill"
+_AGENTS_PROJECT = Path(".agents/skills/nlm-skill")
+
+# Hermes supports $HERMES_HOME override; fall back to ~/.hermes
+_HERMES_HOME = Path(os.environ.get("HERMES_HOME") or _HOME / ".hermes")
+
+
+class ToolConfig(TypedDict, total=False):
+    user: Path
+    project: Path
+    format: str
+    description: str
+    binary: str
+    root_dirs: list[Path]
+    frontmatter_extras: dict[str, str]
+
+
+TOOL_CONFIGS: dict[str, ToolConfig] = {
     "claude-code": {
-        "user": Path.home() / ".claude/skills/nlm-skill",
+        "user": _HOME / ".claude" / "skills" / "nlm-skill",
         "project": Path(".claude/skills/nlm-skill"),
         "format": "skill.md",
         "description": "Claude Code CLI and Desktop",
+        "binary": "claude",
+        "root_dirs": [_HOME / ".claude"],
     },
     "cursor": {
-        "user": Path.home() / ".cursor/skills/nlm-skill",
+        "user": _HOME / ".cursor" / "skills" / "nlm-skill",
         "project": Path(".cursor/skills/nlm-skill"),
         "format": "skill.md",
         "description": "Cursor AI editor",
+        "binary": "cursor",
+        "root_dirs": [_HOME / ".cursor"],
     },
     "agents": {
-        "user": Path.home() / ".agents/skills/nlm-skill",
-        "project": Path(".agents/skills/nlm-skill"),
+        "user": _AGENTS_USER,
+        "project": _AGENTS_PROJECT,
         "format": "skill.md",
         "description": "Generic agent skill (Gemini CLI, Codex, and others)",
+        "root_dirs": [_HOME / ".agents"],
+    },
+    "gemini-cli": {
+        "user": _AGENTS_USER,
+        "project": _AGENTS_PROJECT,
+        "format": "skill.md",
+        "description": "Google Gemini CLI",
+        "binary": "gemini",
+        "root_dirs": [_HOME / ".agents", _HOME / ".gemini"],
+    },
+    "codex": {
+        "user": _AGENTS_USER,
+        "project": _AGENTS_PROJECT,
+        "format": "skill.md",
+        "description": "OpenAI Codex CLI",
+        "binary": "codex",
+        "root_dirs": [_HOME / ".codex", _HOME / ".agents"],
     },
     "opencode": {
-        "user": Path.home() / ".config/opencode/skills/nlm-skill",
+        "user": _HOME / ".config" / "opencode" / "skills" / "nlm-skill",
         "project": Path(".opencode/skills/nlm-skill"),
         "format": "skill.md",
         "description": "OpenCode AI assistant",
+        "binary": "opencode",
+        "root_dirs": [_HOME / ".config" / "opencode"],
     },
     "antigravity": {
-        "user": Path.home() / ".gemini/antigravity/skills/nlm-skill",
-        "project": Path(".agents/skills/nlm-skill"),
+        "user": _HOME / ".gemini" / "antigravity" / "skills" / "nlm-skill",
+        "project": _AGENTS_PROJECT,
         "format": "skill.md",
         "description": "Antigravity agent framework",
+        "root_dirs": [_HOME / ".gemini" / "antigravity"],
     },
     "cline": {
-        "user": Path.home() / ".cline/skills/nlm-skill",
+        "user": _HOME / ".cline" / "skills" / "nlm-skill",
         "project": Path(".cline/skills/nlm-skill"),
         "format": "skill.md",
         "description": "Cline CLI terminal agent",
+        "binary": "cline",
+        "root_dirs": [_HOME / ".cline"],
     },
     "openclaw": {
-        "user": Path.home() / ".openclaw/workspace/skills/nlm-skill",
+        "user": _HOME / ".openclaw" / "workspace" / "skills" / "nlm-skill",
         "project": Path(".openclaw/workspace/skills/nlm-skill"),
         "format": "skill.md",
         "description": "OpenClaw AI agent framework",
+        "binary": "openclaw",
+        "root_dirs": [_HOME / ".openclaw"],
     },
-    "cc-claw": {
-        "user": Path.home() / ".cc-claw/workspace/skills/nlm-skill",
-        "project": Path(".cc-claw/workspace/skills/nlm-skill"),
+    "alef-agent": {
+        "user": _HOME / ".alef-agent" / "workspace" / "skills" / "nlm-skill",
+        "project": Path(".alef-agent/workspace/skills/nlm-skill"),
         "format": "skill.md",
-        "description": "CC-Claw AI agent framework",
+        "description": "Alef Agent AI agent framework",
+        "frontmatter_extras": {"type": "tool", "status": "approved"},
+        "root_dirs": [_HOME / ".alef-agent"],
+    },
+    "hermes": {
+        "user": _HERMES_HOME / "skills" / "nlm-skill",
+        "project": Path(".hermes/skills/nlm-skill"),
+        "format": "skill.md",
+        "description": "Hermes Agent (NousResearch)",
+        "binary": "hermes",
+        "root_dirs": [_HERMES_HOME],
     },
     "other": {
         "project": Path("./nlm-skill-export"),
@@ -74,6 +132,12 @@ TOOL_CONFIGS = {
         "description": "Export all formats for manual installation",
     },
 }
+
+
+def _is_tool_installed(tool: str) -> bool:
+    """Detect whether a tool is actually installed on this system."""
+    config = TOOL_CONFIGS.get(tool, {})
+    return is_tool_on_system(config.get("binary"), config.get("root_dirs"))
 
 
 def complete_tool_name(ctx: Any, param: Any, incomplete: str) -> list[str]:
@@ -150,6 +214,28 @@ def _inject_version_to_frontmatter(skill_path: Path) -> None:
     skill_path.write_text(content, encoding="utf-8")
 
 
+def _inject_frontmatter_extras(skill_path: Path, extras: dict[str, str]) -> None:
+    """Inject extra frontmatter fields into SKILL.md for tool-specific compatibility.
+
+    Used to add fields like `type: tool` and `status: approved` for Alef Agent.
+    """
+    content = skill_path.read_text(encoding="utf-8")
+    if not content.startswith("---"):
+        return
+
+    end_idx = content.index("---", 3)
+    frontmatter = content[3:end_idx]
+
+    for key, value in extras.items():
+        # Remove any existing line for this key
+        frontmatter = re.sub(rf"\n{re.escape(key)}:.*", "", frontmatter)
+        # Add the field
+        frontmatter = frontmatter.rstrip() + f"\n{key}: {value}\n"
+
+    content = "---" + frontmatter + "---" + content[end_idx + 3 :]
+    skill_path.write_text(content, encoding="utf-8")
+
+
 def _get_installed_version(tool: str, level: str) -> str | None:
     """Read the version from an installed skill. Returns None if not found."""
     config = TOOL_CONFIGS[tool]
@@ -207,8 +293,13 @@ def _inject_version_to_agents_md(agents_path: Path) -> None:
         pass
 
 
-def install_skill_md(install_path: Path) -> None:
-    """Install SKILL.md format to a directory."""
+def install_skill_md(install_path: Path, frontmatter_extras: dict[str, str] | None = None) -> None:
+    """Install SKILL.md format to a directory.
+
+    Args:
+        install_path: Target directory for the skill files.
+        frontmatter_extras: Optional extra frontmatter fields to inject (e.g. for Alef Agent).
+    """
     data_dir = get_data_dir()
 
     # Create directory
@@ -221,6 +312,10 @@ def install_skill_md(install_path: Path) -> None:
 
     # Inject current version into frontmatter
     _inject_version_to_frontmatter(skill_dst)
+
+    # Inject tool-specific frontmatter fields (e.g. type/status for Alef Agent)
+    if frontmatter_extras:
+        _inject_frontmatter_extras(skill_dst, frontmatter_extras)
 
     # Copy references directory
     ref_src = data_dir / "references"
@@ -339,11 +434,17 @@ cp -r nlm-skill ~/.agents/skills/
 cp -r nlm-skill ~/.gemini/antigravity/skills/
 ```
 
+### Hermes Agent
+```bash
+cp -r nlm-skill ~/.hermes/skills/
+```
+
 Or for project-level installation, copy to:
 - Claude Code: `.claude/skills/`
 - OpenCode: `.opencode/skills/`
 - Gemini CLI / Codex: `.agents/skills/`
 - Antigravity: `.agents/skills/`
+- Hermes: `.hermes/skills/`
 
 ## Automated Installation
 
@@ -352,7 +453,7 @@ Instead of manual copying, you can use:
 nlm skill install <tool>
 ```
 
-Where `<tool>` is: claude-code, cursor, agents, opencode, antigravity, cline, openclaw, cc-claw.
+Where `<tool>` is: claude-code, cursor, agents, opencode, antigravity, hermes, cline, openclaw, alef-agent.
 
 > **Note:** `agents` replaces the old `gemini-cli` and `codex` entries. The `.agents/skills/`
 > path is the cross-tool compatible alias supported by Gemini CLI (v0.33.1+), Codex, and others.
@@ -372,10 +473,10 @@ Where `<tool>` is: claude-code, cursor, agents, opencode, antigravity, cline, op
 def install(
     tool: str = typer.Argument(
         ...,
-        help="Tool to install skill for (claude-code, cursor, agents, opencode, antigravity, other)",
+        help="Tool to install skill for (claude-code, cursor, agents, hermes, opencode, antigravity, other)",
         shell_complete=complete_tool_name,
     ),
-    level: Literal["user", "project"] = typer.Option(
+    level: str = typer.Option(
         "user",
         "--level",
         "-l",
@@ -390,6 +491,10 @@ def install(
         nlm skill install agents --level project
         nlm skill install other  # Export all formats
     """
+    if level not in ("user", "project"):
+        console.print(f"[red]Error:[/red] Invalid level '{level}'. Must be 'user' or 'project'.")
+        raise typer.Exit(1)
+
     if tool not in TOOL_CONFIGS:
         valid_tools = ", ".join(TOOL_CONFIGS.keys())
         console.print(f"[red]Error:[/red] Unknown tool '{tool}'")
@@ -416,20 +521,15 @@ def install(
     if not install_path:
         install_path = config.get("project")  # Fallback
 
-    # Validate parent directory exists for user-level installs
+    # Validate that the tool is installed for user-level installs
     if level == "user" and install_path:
-        # For SKILL.md format, check the parent of the skill directory
-        # For AGENTS.md format, check the parent of the file
-        if config["format"] == "skill.md" or config["format"] == "agents.md":
-            parent_dir = install_path.parent
-        else:
-            parent_dir = None
+        tool_detected = _is_tool_installed(tool)
 
-        if parent_dir and not parent_dir.exists():
+        if not tool_detected:
             console.print(
-                f"[yellow]Warning:[/yellow] Parent directory does not exist: {parent_dir}"
+                f"[yellow]Warning:[/yellow] {tool} does not appear to be installed on your system."
             )
-            console.print(f"This suggests {tool} may not be installed on your system.")
+            console.print("[dim](No binary on PATH and no config directory found)[/dim]")
             console.print()
 
             # Offer options
@@ -446,8 +546,8 @@ def install(
             )
 
             if choice == 1:
-                console.print(f"[dim]Creating {parent_dir}...[/dim]")
-                parent_dir.mkdir(parents=True, exist_ok=True)
+                console.print(f"[dim]Creating {install_path}...[/dim]")
+                install_path.mkdir(parents=True, exist_ok=True)
             elif choice == 2:
                 console.print("[dim]Switching to project-level installation...[/dim]")
                 level = "project"
@@ -474,7 +574,7 @@ def install(
 
     try:
         if format_type == "skill.md":
-            install_skill_md(install_path)
+            install_skill_md(install_path, config.get("frontmatter_extras"))
         elif format_type == "agents.md":
             install_agents_md(install_path)
         elif format_type == "all":
@@ -496,7 +596,7 @@ def uninstall(
         help="Tool to uninstall skill from",
         shell_complete=complete_tool_name,
     ),
-    level: Literal["user", "project"] = typer.Option(
+    level: str = typer.Option(
         "user",
         "--level",
         "-l",
@@ -510,6 +610,10 @@ def uninstall(
         nlm skill uninstall claude-code
         nlm skill uninstall codex --level project
     """
+    if level not in ("user", "project"):
+        console.print(f"[red]Error:[/red] Invalid level '{level}'. Must be 'user' or 'project'.")
+        raise typer.Exit(1)
+
     if tool not in TOOL_CONFIGS:
         valid_tools = ", ".join(TOOL_CONFIGS.keys())
         console.print(f"[red]Error:[/red] Unknown tool '{tool}'")
@@ -659,7 +763,7 @@ def _update_single_tool(tool: str, level: str) -> bool:
 
     try:
         if format_type == "skill.md":
-            install_skill_md(install_path)
+            install_skill_md(install_path, config.get("frontmatter_extras"))
         elif format_type == "agents.md":
             install_agents_md(install_path)
         elif format_type == "all":

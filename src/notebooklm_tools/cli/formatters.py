@@ -1,12 +1,16 @@
 """Output formatting utilities for NLM CLI."""
 
+from __future__ import annotations
+
 import json
 import sys
 from enum import StrEnum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from rich.console import Console
 from rich.table import Table
+
+if TYPE_CHECKING:
+    from rich.console import Console
 
 
 class OutputFormat(StrEnum):
@@ -56,7 +60,11 @@ class Formatter:
     """Base class for output formatters."""
 
     def __init__(self, console: Console | None = None) -> None:
-        self.console = console or Console()
+        if console is None:
+            from notebooklm_tools.cli.utils import make_console
+
+            console = make_console()
+        self.console = console
 
     def format_notebooks(
         self,
@@ -290,6 +298,19 @@ class TableFormatter(Formatter):
 class JsonFormatter(Formatter):
     """Format output as JSON."""
 
+    ARTIFACT_FULL_FIELDS = (
+        "title",
+        "url",
+        "created_at",
+        "audio_url",
+        "video_url",
+        "infographic_url",
+        "slide_deck_url",
+        "report_content",
+        "flashcard_count",
+        "duration_seconds",
+    )
+
     def format_notebooks(
         self,
         notebooks: list[Any],
@@ -351,10 +372,16 @@ class JsonFormatter(Formatter):
                     "type": art.get("type", ""),
                     "status": art.get("status", ""),
                     "custom_instructions": art.get("custom_instructions", None),  # Always include
+                    "visual_style_prompt": art.get("visual_style_prompt", None),
                 }
                 if full:
+                    # Always include title/url with defaults for backward compat
                     item["title"] = art.get("title", "")
                     item["url"] = art.get("url", "")
+                    # Add rich fields dynamically when present
+                    for field in self.ARTIFACT_FULL_FIELDS:
+                        if field not in ("title", "url") and field in art:
+                            item[field] = art.get(field)
             else:
                 item = {
                     "id": art.id,
@@ -363,10 +390,18 @@ class JsonFormatter(Formatter):
                     "custom_instructions": getattr(
                         art, "custom_instructions", None
                     ),  # Always include
+                    "visual_style_prompt": getattr(art, "visual_style_prompt", None),
                 }
                 if full:
+                    # Always include title/url with defaults for backward compat
                     item["title"] = getattr(art, "title", "")
                     item["url"] = getattr(art, "url", "")
+                    # Add rich fields dynamically when present
+                    for field in self.ARTIFACT_FULL_FIELDS:
+                        if field not in ("title", "url"):
+                            value = getattr(art, field, None)
+                            if value is not None or hasattr(art, field):
+                                item[field] = value
             data.append(item)
         print_json(data)
 

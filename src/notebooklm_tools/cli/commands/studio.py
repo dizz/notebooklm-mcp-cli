@@ -1,18 +1,17 @@
 """Studio CLI commands for generation (audio, report, quiz, etc.)."""
 
 import typer
-from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from notebooklm_tools.cli.formatters import detect_output_format, get_formatter
-from notebooklm_tools.cli.utils import get_client, handle_error
+from notebooklm_tools.cli.utils import get_client, handle_error, make_console
 from notebooklm_tools.core.alias import get_alias_manager
 from notebooklm_tools.core.exceptions import NLMError
 from notebooklm_tools.services import ServiceError, ValidationError
 from notebooklm_tools.services import studio as studio_service
 from notebooklm_tools.utils.config import get_default_language
 
-console = Console()
+console = make_console()
 
 # Main studio app for status/delete
 app = typer.Typer(
@@ -136,15 +135,15 @@ def studio_status(
     json_output: bool = typer.Option(False, "--json", "-j", help="Output as JSON"),
     profile: str | None = typer.Option(None, "--profile", "-p", help="Profile to use"),
 ) -> None:
-    """List all studio artifacts and their status."""
+    """List all studio artifacts and their status (including mind maps)."""
     try:
         notebook_id = get_alias_manager().resolve(notebook_id)
         with get_client(profile) as client:
-            artifacts = client.poll_studio_status(notebook_id)
+            result = studio_service.get_studio_status(client, notebook_id)
 
         fmt = detect_output_format(json_output)
         formatter = get_formatter(fmt, console)
-        formatter.format_artifacts(artifacts, full=full)
+        formatter.format_artifacts(result["artifacts"], full=full)
     except (ServiceError, NLMError) as e:
         handle_error(e, json_output=locals().get("json_output", False))
 
@@ -185,11 +184,9 @@ def studio_rename(
             result = studio_service.rename_artifact(client, artifact_id, new_title)
         console.print(f"[green]✓[/green] Renamed artifact to: {result['new_title']}")
     except (ValidationError, ServiceError) as e:
-        msg = e.user_message if isinstance(e, ServiceError) else str(e)
-        console.print(f"[red]Error:[/red] {msg}")
-        raise typer.Exit(1) from e
+        handle_error(e)
     except NLMError as e:
-        handle_error(e, json_output=locals().get("json_output", False))
+        handle_error(e)
 
 
 # ========== Audio ==========
@@ -510,11 +507,9 @@ def revise_slides(
         console.print(f"  Original: {artifact_id}")
         console.print("\n[dim]Run 'nlm studio status <notebook-id>' to check progress.[/dim]")
     except (ValidationError, ServiceError) as e:
-        msg = e.user_message if isinstance(e, ServiceError) else str(e)
-        console.print(f"[red]Error:[/red] {msg}")
-        raise typer.Exit(1) from e
+        handle_error(e)
     except NLMError as e:
-        handle_error(e, json_output=locals().get("json_output", False))
+        handle_error(e)
 
 
 # ========== Infographic ==========
@@ -575,12 +570,21 @@ def create_video(
         "auto_select",
         "--style",
         "-s",
-        help="Visual style: auto_select, classic, whiteboard, kawaii, anime, watercolor, retro_print, heritage, paper_craft",
+        help="Visual style: auto_select, custom, classic, whiteboard, kawaii, anime, watercolor, retro_print, heritage, paper_craft",
+    ),
+    style_prompt: str = typer.Option(
+        "",
+        "--style-prompt",
+        help="Custom visual style description. For explainer/brief: implies --style custom. For cinematic: mapped to --focus (custom_instructions).",
     ),
     language: str = typer.Option(
         "", "--language", help="BCP-47 language code (default: NOTEBOOKLM_HL or en)"
     ),
-    focus: str = typer.Option("", "--focus", help="Optional focus topic"),
+    focus: str = typer.Option(
+        "",
+        "--focus",
+        help="Focus topic or creative direction. For cinematic format, this is the full steering prompt (visual style, audience, narrative).",
+    ),
     source_ids: str | None = typer.Option(None, "--source-ids", help="Comma-separated source IDs"),
     confirm: bool = typer.Option(False, "--confirm", "-y", help="Skip confirmation"),
     profile: str | None = typer.Option(None, "--profile", "-p", help="Profile to use"),
@@ -597,6 +601,7 @@ def create_video(
         source_ids=parse_source_ids(source_ids),
         video_format=format,
         visual_style=style,
+        video_style_prompt=style_prompt,
         language=language,
         focus_prompt=focus,
     )

@@ -9,7 +9,9 @@ import json
 import logging
 import os
 import urllib.parse
-from typing import Any
+from typing import Any, Protocol, cast
+
+import httpx as _httpx
 
 from .base import BaseClient
 from .data_types import ConversationTurn
@@ -34,7 +36,7 @@ GOOGLE_ERROR_CODES = {
 class QueryRejectedError(NotebookLMError):
     """Raised when Google returns an error response instead of an answer."""
 
-    def __init__(self, error_code: int, error_type: str = "", raw_detail: str = ""):
+    def __init__(self, error_code: int, error_type: str = "", raw_detail: str = "") -> None:
         code_name = GOOGLE_ERROR_CODES.get(error_code, "UNKNOWN")
         msg = f"Google rejected the query (error code {error_code}: {code_name})"
         if error_type:
@@ -44,6 +46,10 @@ class QueryRejectedError(NotebookLMError):
         self.code_name = code_name
         self.error_type = error_type
         self.raw_detail = raw_detail
+
+
+class _NotebookLookupProtocol(Protocol):
+    def get_notebook(self, notebook_id: str) -> Any: ...
 
 
 class ConversationMixin(BaseClient):
@@ -59,7 +65,9 @@ class ConversationMixin(BaseClient):
     # Conversation Cache Management
     # =========================================================================
 
-    def _build_conversation_history(self, conversation_id: str) -> list | None:
+    def _build_conversation_history(
+        self, conversation_id: str
+    ) -> list[list[str | None | int]] | None:
         """Build the conversation history array for follow-up queries.
 
         Chrome expects history in format: [[answer, null, 2], [query, null, 1], ...]
@@ -74,7 +82,8 @@ class ConversationMixin(BaseClient):
         Returns:
             List in Chrome's expected format, or None if no history exists
         """
-        turns = self._conversation_cache.get(conversation_id, [])
+        with self._state_lock:
+            turns = list(self._conversation_cache.get(conversation_id, []))
         if not turns:
             return None
 
@@ -89,23 +98,26 @@ class ConversationMixin(BaseClient):
 
     def _cache_conversation_turn(self, conversation_id: str, query: str, answer: str) -> None:
         """Cache a conversation turn for future follow-up queries."""
-        if conversation_id not in self._conversation_cache:
-            self._conversation_cache[conversation_id] = []
+        with self._state_lock:
+            if conversation_id not in self._conversation_cache:
+                self._conversation_cache[conversation_id] = []
 
-        turn_number = len(self._conversation_cache[conversation_id]) + 1
-        turn = ConversationTurn(query=query, answer=answer, turn_number=turn_number)
-        self._conversation_cache[conversation_id].append(turn)
+            turn_number = len(self._conversation_cache[conversation_id]) + 1
+            turn = ConversationTurn(query=query, answer=answer, turn_number=turn_number)
+            self._conversation_cache[conversation_id].append(turn)
 
     def clear_conversation(self, conversation_id: str) -> bool:
         """Clear the conversation cache for a specific conversation."""
-        if conversation_id in self._conversation_cache:
-            del self._conversation_cache[conversation_id]
-            return True
-        return False
+        with self._state_lock:
+            if conversation_id in self._conversation_cache:
+                del self._conversation_cache[conversation_id]
+                return True
+            return False
 
-    def get_conversation_history(self, conversation_id: str) -> list[dict] | None:
+    def get_conversation_history(self, conversation_id: str) -> list[dict[str, str | int]] | None:
         """Get the conversation history for a specific conversation."""
-        turns = self._conversation_cache.get(conversation_id)
+        with self._state_lock:
+            turns = list(self._conversation_cache.get(conversation_id, []))
         if not turns:
             return None
 
@@ -167,7 +179,8 @@ class ConversationMixin(BaseClient):
             path=f"/notebook/{notebook_id}",
         )
         # Also clear local cache if present
-        self._conversation_cache.pop(conversation_id, None)
+        with self._state_lock:
+            self._conversation_cache.pop(conversation_id, None)
         return result is not None
 
     # =========================================================================
@@ -181,7 +194,7 @@ class ConversationMixin(BaseClient):
         source_ids: list[str] | None = None,
         conversation_id: str | None = None,
         timeout: float = 120.0,
-    ) -> dict | None:
+    ) -> dict[str, Any] | None:
         """Query the notebook with a question.
 
         Supports both new conversations and follow-up queries. For follow-ups,
@@ -206,15 +219,13 @@ class ConversationMixin(BaseClient):
               cited_text (the actual passage text from the source)
             - turn_number: Which turn this is in the conversation (1 = first)
             - is_follow_up: Whether this was a follow-up query
-            - raw_response: The raw parsed response (for debugging)
         """
         import uuid
 
-        client = self._get_client()
-
         # If no source_ids provided, get them from the notebook
         if source_ids is None:
-            notebook_data = self.get_notebook(notebook_id)
+            notebook_client = cast(_NotebookLookupProtocol, self)
+            notebook_data = notebook_client.get_notebook(notebook_id)
             source_ids = self._extract_source_ids_from_notebook(notebook_data)
 
         # Determine if this is a new conversation or follow-up
@@ -232,7 +243,10 @@ class ConversationMixin(BaseClient):
                 conversation_history = None
         else:
             # Check if we have cached history for this conversation
+            assert conversation_id is not None
             conversation_history = self._build_conversation_history(conversation_id)
+
+        assert conversation_id is not None
 
         # Build source IDs structure: [[[sid]]] for each source (3 brackets, not 4!)
         sources_array = [[[sid]] for sid in source_ids] if source_ids else []
@@ -261,11 +275,13 @@ class ConversationMixin(BaseClient):
         # Add trailing & to match NotebookLM's format
         body = "&".join(body_parts) + "&"
 
-        self._reqid_counter += 100000  # Increment counter
+        with self._state_lock:
+            self._reqid_counter += 100000
+            reqid = self._reqid_counter
         url_params = {
             "bl": os.environ.get("NOTEBOOKLM_BL") or getattr(self, "_bl", "") or self._BL_FALLBACK,
             "hl": os.environ.get("NOTEBOOKLM_HL", "en"),
-            "_reqid": str(self._reqid_counter),
+            "_reqid": str(reqid),
             "rt": "c",
         }
         if self._session_id:
@@ -274,8 +290,13 @@ class ConversationMixin(BaseClient):
         query_string = urllib.parse.urlencode(url_params)
         url = f"{self._get_base_url()}{self.QUERY_ENDPOINT}?{query_string}"
 
-        response = client.post(url, content=body, timeout=timeout)
-        response.raise_for_status()
+        cookies = self._get_httpx_cookies()
+        # The streamed query endpoint is stricter than batchexecute and rejects
+        # form-encoded payloads without an explicit Content-Type header.
+        headers = {"Content-Type": "application/x-www-form-urlencoded;charset=UTF-8"}
+        with _httpx.Client(timeout=timeout, cookies=cookies, headers=headers) as client:
+            response = client.post(url, content=body)
+            response.raise_for_status()
 
         logger.debug("Raw query response (first 2000 chars): %s", response.text[:2000])
 
@@ -286,11 +307,12 @@ class ConversationMixin(BaseClient):
         # This is the key mechanism for chat history persistence — the server
         # returns its own conversation ID which tracks the chat across sessions.
         if server_conv_id and server_conv_id != conversation_id:
-            # Migrate local cache to the server-assigned ID
-            if conversation_id in self._conversation_cache:
-                self._conversation_cache[server_conv_id] = self._conversation_cache.pop(
-                    conversation_id
-                )
+            with self._state_lock:
+                # Migrate local cache to the server-assigned ID
+                if conversation_id in self._conversation_cache:
+                    self._conversation_cache[server_conv_id] = self._conversation_cache.pop(
+                        conversation_id
+                    )
             conversation_id = server_conv_id
 
         # Cache this turn for future follow-ups (only if we got an answer)
@@ -298,8 +320,9 @@ class ConversationMixin(BaseClient):
             self._cache_conversation_turn(conversation_id, query_text, answer_text)
 
         # Calculate turn number
-        turns = self._conversation_cache.get(conversation_id, [])
-        turn_number = len(turns)
+        with self._state_lock:
+            turns = self._conversation_cache.get(conversation_id, [])
+            turn_number = len(turns)
 
         return {
             "answer": answer_text,
@@ -309,12 +332,11 @@ class ConversationMixin(BaseClient):
             "references": citation_data.get("references", []),
             "turn_number": turn_number,
             "is_follow_up": not is_new_conversation,
-            "raw_response": response.text[:1000] if response.text else "",
         }
 
     def _extract_source_ids_from_notebook(self, notebook_data: Any) -> list[str]:
         """Extract source IDs from notebook data."""
-        source_ids = []
+        source_ids: list[str] = []
         if not notebook_data or not isinstance(notebook_data, list):
             return source_ids
 
@@ -343,7 +365,7 @@ class ConversationMixin(BaseClient):
     # Response Parsing
     # =========================================================================
 
-    def _parse_query_response(self, response_text: str) -> tuple[str, dict, str | None]:
+    def _parse_query_response(self, response_text: str) -> tuple[str, dict[str, Any], str | None]:
         """Parse the streaming response from the query endpoint.
 
         The query endpoint returns a streaming response with multiple chunks.
@@ -365,8 +387,8 @@ class ConversationMixin(BaseClient):
         lines = response_text.strip().split("\n")
         longest_answer = ""
         longest_thinking = ""
-        answer_citation_data: dict = {}
-        detected_errors: list[dict] = []
+        answer_citation_data: dict[str, Any] = {}
+        detected_errors: list[dict[str, Any]] = []
         server_conv_id: str | None = None
 
         def _process_chunk(json_line: str) -> None:
@@ -417,7 +439,7 @@ class ConversationMixin(BaseClient):
 
         return result, answer_citation_data, server_conv_id
 
-    def _extract_error_from_chunk(self, json_str: str) -> dict | None:
+    def _extract_error_from_chunk(self, json_str: str) -> dict[str, Any] | None:
         """Check if a JSON chunk contains a Google API error.
 
         Error responses have item[2] as null/None and error info in item[5]:
@@ -468,7 +490,7 @@ class ConversationMixin(BaseClient):
 
     def _extract_answer_from_chunk(
         self, json_str: str
-    ) -> tuple[str | None, bool, dict, str | None]:
+    ) -> tuple[str | None, bool, dict[str, Any], str | None]:
         """Extract answer text, citation data, and server-assigned conversation ID from a single JSON chunk.
 
         The chunk structure is:
@@ -521,7 +543,7 @@ class ConversationMixin(BaseClient):
                     answer_text = first_elem[0]
                     if isinstance(answer_text, str) and len(answer_text) > 20:
                         is_answer = False
-                        citation_data: dict = {}
+                        citation_data: dict[str, Any] = {}
                         server_conv_id: str | None = None
 
                         # Extract server-assigned conversation ID from conv_data
@@ -544,7 +566,7 @@ class ConversationMixin(BaseClient):
         return None, False, {}, None
 
     @staticmethod
-    def _extract_cited_text(detail: list) -> str | None:
+    def _extract_cited_text(detail: list[Any]) -> str | None:
         """Extract cited text from a passage detail structure.
 
         The text passages are at detail[4], which contains elements in two variants:
@@ -607,7 +629,7 @@ class ConversationMixin(BaseClient):
         return " ".join(texts) if texts else None
 
     @staticmethod
-    def _extract_text_from_table_rows(rows: list) -> list[list[str]]:
+    def _extract_text_from_table_rows(rows: list[Any]) -> list[list[str]]:
         """Parse table rows into a structured list of rows, each a list of cell strings.
 
         Table segments have their data at segment[4] = [dim1, dim2, rows_array].
@@ -658,7 +680,7 @@ class ConversationMixin(BaseClient):
         return parsed_rows
 
     @staticmethod
-    def _extract_table_from_detail(detail: list) -> dict | None:
+    def _extract_table_from_detail(detail: list[Any]) -> dict[str, Any] | None:
         """Extract structured table data from a passage detail.
 
         Scans detail[4] for table/grid segments (where segment[2] is null and
@@ -701,7 +723,7 @@ class ConversationMixin(BaseClient):
         return None
 
     @staticmethod
-    def _extract_citation_data(type_info: list) -> dict:
+    def _extract_citation_data(type_info: list[Any]) -> dict[str, Any]:
         """Extract source IDs and cited text from the citation passages in a type-1 answer chunk.
 
         The source passages are at type_info[3] (i.e. first_elem[4][3]).
@@ -726,7 +748,7 @@ class ConversationMixin(BaseClient):
 
             citations: dict[int, str] = {}
             seen_sources: dict[str, None] = {}  # ordered set via dict
-            references: list[dict] = []
+            references: list[dict[str, Any]] = []
 
             for i, passage in enumerate(passages):
                 if not isinstance(passage, list) or len(passage) < 2:
@@ -752,7 +774,7 @@ class ConversationMixin(BaseClient):
                     # Extract cited text from passage detail
                     cited_text = ConversationMixin._extract_cited_text(detail)
 
-                    ref_entry: dict = {
+                    ref_entry: dict[str, Any] = {
                         "source_id": source_id,
                         "citation_number": citation_number,
                     }

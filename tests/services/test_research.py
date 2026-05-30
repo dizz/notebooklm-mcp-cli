@@ -1,12 +1,13 @@
 """Tests for services.research module."""
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from notebooklm_tools.core.errors import RPCError
 from notebooklm_tools.services.errors import ServiceError, ValidationError
 from notebooklm_tools.services.research import (
+    annotate_cited_sources,
     import_research,
     poll_research,
     start_research,
@@ -163,10 +164,123 @@ class TestPollResearch:
         assert len(result["sources"]) == 6  # 5 + note
         assert "more sources" in str(result["sources"][-1])
 
+    def test_completed_status_marks_cited_sources(self, mock_client):
+        report = (
+            "The report relies on the second source [1].\n\n"
+            "1. Cited Paper, [https://example.com/cited](https://example.com/cited)"
+        )
+        mock_client.poll_research.return_value = {
+            "status": "completed",
+            "task_id": "t-1",
+            "sources": [
+                {"index": 0, "title": "Uncited", "url": "https://example.com/uncited"},
+                {"index": 1, "title": "Cited Paper", "url": "https://example.com/cited"},
+            ],
+            "report": report,
+        }
+
+        result = poll_research(mock_client, "nb-1", compact=False)
+
+        assert result["sources"][0]["cited"] is False
+        assert result["sources"][1]["cited"] is True
+
     def test_api_error_raises_service_error(self, mock_client):
         mock_client.poll_research.side_effect = RuntimeError("fail")
         with pytest.raises(ServiceError, match="Failed to poll"):
             poll_research(mock_client, "nb-1")
+
+    def test_single_check_default(self, mock_client):
+        """Default max_wait=0 does a single check and returns immediately."""
+        mock_client.poll_research.return_value = {
+            "status": "in_progress",
+            "task_id": "task-1",
+            "sources": [],
+            "report": "",
+        }
+
+        result = poll_research(mock_client, "nb-1")
+
+        assert result["status"] == "in_progress"
+        assert mock_client.poll_research.call_count == 1
+
+    @patch("notebooklm_tools.services.research.time")
+    def test_blocking_polls_until_completed(self, mock_time, mock_client):
+        """With max_wait > 0, polls repeatedly until status is completed."""
+        # Simulate monotonic clock advancing by poll_interval each call
+        mock_time.monotonic.side_effect = [0, 0, 5, 5, 10]
+        mock_time.sleep = MagicMock()
+
+        mock_client.poll_research.side_effect = [
+            {"status": "in_progress", "task_id": "t-1", "sources": [], "report": ""},
+            {
+                "status": "completed",
+                "task_id": "t-1",
+                "sources": [{"title": "A"}],
+                "report": "Done",
+            },
+        ]
+
+        result = poll_research(mock_client, "nb-1", poll_interval=5, max_wait=30)
+
+        assert result["status"] == "completed"
+        assert mock_client.poll_research.call_count == 2
+        mock_time.sleep.assert_called_once_with(5)
+
+    @patch("notebooklm_tools.services.research.time")
+    def test_blocking_respects_timeout(self, mock_time, mock_client):
+        """Polling stops and returns in_progress when max_wait is exceeded."""
+        # monotonic calls: [deadline calc, remaining check after poll]
+        # deadline = 0 + 10 = 10; remaining = 10 - 11 = -1 → break
+        mock_time.monotonic.side_effect = [0, 11]
+        mock_time.sleep = MagicMock()
+
+        mock_client.poll_research.return_value = {
+            "status": "in_progress",
+            "task_id": "t-1",
+            "sources": [],
+            "report": "",
+        }
+
+        result = poll_research(mock_client, "nb-1", poll_interval=5, max_wait=10)
+
+        assert result["status"] == "in_progress"
+        assert mock_client.poll_research.call_count == 1
+        mock_time.sleep.assert_not_called()
+
+    @patch("notebooklm_tools.services.research.time")
+    def test_blocking_sleep_clamped_to_remaining(self, mock_time, mock_client):
+        """Sleep duration is clamped to remaining time when less than poll_interval."""
+        # monotonic calls: [deadline calc, remaining after poll 1, remaining after poll 2]
+        # deadline = 0 + 8 = 8; remaining = 8 - 5 = 3 → sleep(min(5,3)=3);
+        # remaining = 8 - 9 = -1 → break
+        mock_time.monotonic.side_effect = [0, 5, 9]
+        mock_time.sleep = MagicMock()
+
+        mock_client.poll_research.side_effect = [
+            {"status": "in_progress", "task_id": "t-1", "sources": [], "report": ""},
+            {"status": "in_progress", "task_id": "t-1", "sources": [], "report": ""},
+        ]
+
+        result = poll_research(mock_client, "nb-1", poll_interval=5, max_wait=8)
+
+        assert result["status"] == "in_progress"
+        assert mock_client.poll_research.call_count == 2
+        # Sleep should be clamped to remaining (3), not full poll_interval (5)
+        mock_time.sleep.assert_called_once_with(3)
+
+    @patch("notebooklm_tools.services.research.time")
+    def test_blocking_no_research_returns_immediately(self, mock_time, mock_client):
+        """If no research is found, returns immediately even with max_wait > 0."""
+        mock_time.monotonic.side_effect = [0]
+        mock_time.sleep = MagicMock()
+
+        mock_client.poll_research.return_value = None
+
+        result = poll_research(mock_client, "nb-1", max_wait=300)
+
+        assert result["status"] == "no_research"
+        assert mock_client.poll_research.call_count == 1
+        mock_time.sleep.assert_not_called()
 
 
 class TestImportResearch:
@@ -187,6 +301,25 @@ class TestImportResearch:
 
         assert result["imported_count"] == 3
 
+        # Verify it passes the requested task ID if no mutated ID is returned
+        call_args = mock_client.import_research_sources.call_args
+        assert call_args.kwargs["task_id"] == "task-1"
+
+    def test_import_resolves_mutated_task_id(self, mock_client):
+        """Verify that deep research task_id mutations are handled."""
+        mock_client.poll_research.return_value = {
+            "status": "completed",
+            "task_id": "mutated-task-999",
+            "sources": [{"title": "A"}],
+        }
+        mock_client.import_research_sources.return_value = [{"title": "A"}]
+
+        import_research(mock_client, "nb-1", "task-1")
+
+        call_args = mock_client.import_research_sources.call_args
+        # Should pass the mutated task ID from poll_research, not the request task_id
+        assert call_args.kwargs["task_id"] == "mutated-task-999"
+
     def test_import_selected_indices(self, mock_client):
         mock_client.poll_research.return_value = {
             "status": "completed",
@@ -199,6 +332,94 @@ class TestImportResearch:
         # Verify the correct source was passed
         call_args = mock_client.import_research_sources.call_args
         assert call_args.kwargs["sources"] == [{"title": "B"}]
+
+    def test_import_cited_only_resolves_bibliography_urls(self, mock_client):
+        sources = [
+            {"index": 0, "title": "Unused", "url": "https://example.com/unused"},
+            {"index": 1, "title": "Also unused", "url": "https://example.com/also-unused"},
+            {"index": 2, "title": "Cited", "url": "https://example.com/cited"},
+        ]
+        mock_client.poll_research.return_value = {
+            "status": "completed",
+            "sources": sources,
+            "report": (
+                "NotebookLM cites bibliography item one [1].\n\n"
+                "1. Cited, [https://example.com/cited](https://example.com/cited)"
+            ),
+        }
+        mock_client.import_research_sources.return_value = [{"title": "Cited"}]
+
+        import_research(mock_client, "nb-1", "task-1", cited_only=True)
+
+        call_args = mock_client.import_research_sources.call_args
+        assert call_args.kwargs["sources"] == [sources[2]]
+
+    def test_import_cited_only_overrides_source_indices(self, mock_client):
+        sources = [
+            {"index": 0, "title": "Manual pick", "url": "https://example.com/manual"},
+            {"index": 1, "title": "Cited", "url": "https://example.com/cited"},
+        ]
+        mock_client.poll_research.return_value = {
+            "status": "completed",
+            "sources": sources,
+            "report": (
+                "The report cites the second source [1].\n\n"
+                "1. Cited, [https://example.com/cited](https://example.com/cited)"
+            ),
+        }
+        mock_client.import_research_sources.return_value = [{"title": "Cited"}]
+
+        import_research(
+            mock_client,
+            "nb-1",
+            "task-1",
+            source_indices=[0],
+            cited_only=True,
+        )
+
+        call_args = mock_client.import_research_sources.call_args
+        assert call_args.kwargs["sources"] == [sources[1]]
+
+    def test_import_cited_only_falls_back_to_all_sources_without_citations(self, mock_client):
+        sources = [
+            {"index": 0, "title": "A", "url": "https://example.com/a"},
+            {"index": 1, "title": "B", "url": "https://example.com/b"},
+        ]
+        mock_client.poll_research.return_value = {
+            "status": "completed",
+            "sources": sources,
+            "report": "The report has no citation markers or bibliography.",
+        }
+        mock_client.import_research_sources.return_value = [{"title": "A"}, {"title": "B"}]
+
+        import_research(mock_client, "nb-1", "task-1", cited_only=True)
+
+        call_args = mock_client.import_research_sources.call_args
+        assert call_args.kwargs["sources"] == sources
+
+    def test_annotate_cited_sources_skips_duplicate_title_false_positive(self):
+        sources = [
+            {
+                "index": 0,
+                "title": "Embedding-Based Context-Aware Reranker",
+                "url": "https://example.com/paper-v1",
+            },
+            {
+                "index": 1,
+                "title": "Embedding-Based Context-Aware Reranker",
+                "url": "https://example.com/paper-v2",
+            },
+        ]
+        report = (
+            "Embedding-Based Context-Aware Reranker improves retrieval [1].\n\n"
+            "1. Embedding-Based Context-Aware Reranker, "
+            "[https://example.com/paper-v2](https://example.com/paper-v2)"
+        )
+
+        annotated = annotate_cited_sources(sources, report)
+
+        assert annotated[0]["cited"] is False
+        assert annotated[1]["cited"] is True
 
     def test_no_research_raises_service_error(self, mock_client):
         mock_client.poll_research.return_value = {"status": "no_research"}

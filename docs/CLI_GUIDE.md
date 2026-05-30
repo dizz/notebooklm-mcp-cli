@@ -89,8 +89,9 @@ nlm audio create <notebook> --format deep_dive --length long --confirm
 # Video
 nlm video create <notebook> --confirm
 nlm video create <notebook> --format explainer --style classic --confirm
-# Formats: explainer, brief
-# Styles: auto_select, classic, whiteboard, kawaii, anime, watercolor, retro_print, heritage, paper_craft
+nlm video create <notebook> --style custom --style-prompt "A children's storybook illustration" --confirm
+# Formats: explainer, brief, cinematic
+# Styles: auto_select, custom, classic, whiteboard, kawaii, anime, watercolor, retro_print, heritage, paper_craft
 
 # Reports
 nlm report create <notebook> --format "Briefing Doc" --confirm
@@ -133,9 +134,11 @@ nlm download flashcards <notebook> <artifact-id> --format markdown --output card
 nlm research start "query" --notebook-id <id> --mode fast  # Quick search
 nlm research start "query" --notebook-id <id> --mode deep  # Extended research
 nlm research start "query" --notebook-id <id> --source drive  # Search Drive
+nlm research start "query" --notebook-id <id> --auto-import # Start, poll, and import in one step
 nlm research status <notebook> --max-wait 300              # Poll until done
 nlm research import <notebook> <task-id>                   # Import sources
 nlm research import <notebook> <task-id> --timeout 600     # Custom timeout (default: 300s)
+nlm research import <notebook> <task-id> --cited-only      # Import cited deep research sources
 ```
 
 ### Studio Status
@@ -222,7 +225,7 @@ nlm config set output.format json       # Change default output format
 | `output.format` | `table` | Default output format (table, json) |
 | `output.color` | `true` | Enable colored output |
 | `output.short_ids` | `true` | Show shortened IDs |
-| `auth.browser` | `auto` | Preferred browser for login (auto, chrome, arc, brave, edge, chromium, vivaldi, opera). Falls back to auto if preferred browser is not found. |
+| `auth.browser` | `auto` | Preferred browser for login (auto, chrome, arc, brave, edge, chromium, vivaldi, opera). Falls back to auto if the preferred browser is not found. |
 | `auth.default_profile` | `default` | Profile to use when `--profile` not specified. **Note:** The MCP Server always uses the active default profile. Changing this setting will instantaneously switch the MCP server's Google account. |
 
 ### Aliases (Shortcuts)
@@ -244,7 +247,6 @@ nlm source list myproject
 nlm skill list                           # Show installation status
 nlm skill install claude-code            # Install for Claude Code
 nlm skill install cursor                 # Install for Cursor AI
-nlm skill install agents               # Install for Gemini CLI / Codex
 nlm skill install <tool> --level project # Install at project level
 nlm skill uninstall <tool>               # Remove skill
 nlm skill show                           # View skill content
@@ -254,7 +256,21 @@ nlm install skill claude-code
 nlm list skills
 ```
 
-**Supported Tools:** `claude-code`, `cursor`, `agents`, `opencode`, `antigravity`, `cline`, `openclaw`, `other`
+**Gemini CLI, Codex, and other agent CLIs** all install to `~/.agents/skills/nlm-skill/` (`.agents/skills/` at project level). These three targets are interchangeable aliases:
+
+```bash
+nlm skill install agents      # Generic name
+nlm skill install codex       # Alias for OpenAI Codex CLI
+nlm skill install gemini-cli  # Alias for Google Gemini CLI
+```
+
+**Alef Agent** (CLI target `alef-agent`) is separate: it installs under `~/.alef-agent/workspace/skills/nlm-skill/` with tool-specific skill frontmatter, not under `.agents/skills/`.
+
+```bash
+nlm skill install alef-agent
+```
+
+**Supported Tools:** `claude-code`, `cursor`, `agents`, `gemini-cli`, `codex`, `opencode`, `antigravity`, `cline`, `openclaw`, `alef-agent`, `other`
 
 ### Setup (MCP Server Configuration)
 
@@ -263,6 +279,7 @@ Configure the NotebookLM MCP server for AI tools in one command:
 ```bash
 nlm setup add claude-code       # Configure via `claude mcp add`
 nlm setup add gemini            # Write ~/.gemini/settings.json
+nlm setup add github-copilot    # Write .vscode/mcp.json
 nlm setup add cursor            # Write ~/.cursor/mcp.json
 nlm setup add windsurf          # Write mcp_config.json
 nlm setup add json              # Generate JSON config for any tool
@@ -272,7 +289,7 @@ nlm setup remove gemini         # Remove from Gemini CLI
 nlm setup list                  # Show all clients and config status
 ```
 
-**Supported Clients:** `claude-code`, `gemini`, `cursor`, `windsurf`, `cline`, `antigravity`, `codex`
+**Supported Clients:** `claude-code`, `gemini`, `github-copilot`, `cursor`, `windsurf`, `cline`, `antigravity`, `codex`, `opencode`
 
 **For unsupported tools:** Use `nlm setup add json` to interactively generate a JSON config snippet. Choose between uvx or regular mode, full path or command name, and whether to include the `mcpServers` wrapper. The result is printed and can be copied to clipboard.
 

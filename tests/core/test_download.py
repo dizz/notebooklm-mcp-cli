@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Tests for DownloadMixin."""
 
+from unittest.mock import AsyncMock, patch
+
+import pytest
+
 from notebooklm_tools.core.base import BaseClient
 from notebooklm_tools.core.download import DownloadMixin
 
@@ -112,3 +116,139 @@ class TestDownloadMixinMethods:
         assert "## Card 1" in result
         assert "**Front:** Front text" in result
         assert "**Back:** Back text" in result
+
+    def test_is_audio_artifact_ready_accepts_verified_status_2_payload(self):
+        mixin = DownloadMixin(cookies={"test": "cookie"}, csrf_token="test")
+        artifact = [
+            "art-1",
+            "Audio",
+            mixin.STUDIO_TYPE_AUDIO,
+            [],
+            2,
+            None,
+            [
+                None,
+                ["", 2, None, [["src-1"]], "en", True, 1],
+                "https://example.com/thumb",
+                "https://example.com/thumb-dv",
+                None,
+                [["https://example.com/audio.m4a", 1, "audio/mp4"]],
+                [],
+            ],
+        ]
+
+        assert mixin._is_audio_artifact_ready(artifact) is True
+
+    @pytest.mark.asyncio
+    async def test_download_audio_accepts_verified_status_2_payload(self):
+        mixin = DownloadMixin(cookies={"test": "cookie"}, csrf_token="test")
+        artifact = [
+            "art-1",
+            "Audio",
+            mixin.STUDIO_TYPE_AUDIO,
+            [],
+            2,
+            None,
+            [
+                None,
+                ["", 2, None, [["src-1"]], "en", True, 1],
+                "https://example.com/thumb",
+                "https://example.com/thumb-dv",
+                None,
+                [["https://example.com/audio.m4a", 1, "audio/mp4"]],
+                [],
+            ],
+        ]
+
+        mixin._list_raw = lambda notebook_id: [artifact]
+        mixin._download_url = AsyncMock(return_value="/tmp/audio.m4a")
+
+        result = await mixin.download_audio("nb-1", "/tmp/audio.m4a")
+
+        assert result == "/tmp/audio.m4a"
+        mixin._download_url.assert_awaited_once_with(
+            "https://example.com/audio.m4a",
+            "/tmp/audio.m4a",
+            None,
+        )
+
+
+class TestDownloadUrlCookies:
+    """Cookie handling for cross-domain artifact downloads."""
+
+    @pytest.mark.asyncio
+    async def test_download_url_strips_osid_cookies(self, tmp_path):
+        """OSID cookies must be removed before issuing the download request.
+
+        OSID is scoped to notebooklm.google.com. If it leaks onto a download
+        host such as lh3.googleusercontent.com, Google treats the request as
+        an invalid session and redirects to ServiceLogin.
+        """
+        mixin = DownloadMixin(
+            cookies=[
+                {"name": "SID", "value": "sid-value", "domain": ".google.com", "path": "/"},
+                {"name": "OSID", "value": "osid-value", "domain": ".google.com", "path": "/"},
+                {
+                    "name": "__Secure-OSID",
+                    "value": "secure-osid-value",
+                    "domain": ".google.com",
+                    "path": "/",
+                },
+            ],
+            csrf_token="token",
+        )
+
+        captured = {}
+
+        class MockStreamResponse:
+            headers = {
+                "content-length": "4",
+                "content-type": "application/octet-stream",
+            }
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+            def raise_for_status(self):
+                return None
+
+            async def aiter_bytes(self, chunk_size=8192):
+                yield b"data"
+
+        class MockAsyncClient:
+            def __init__(self, *, cookies, headers, follow_redirects, timeout):
+                captured["cookies"] = cookies
+                captured["headers"] = headers
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+            def stream(self, method, url):
+                return MockStreamResponse()
+
+        output = tmp_path / "out.bin"
+
+        with patch("notebooklm_tools.core.download.httpx.AsyncClient", MockAsyncClient):
+            result = await mixin._download_url(
+                "https://lh3.googleusercontent.com/file", str(output)
+            )
+
+        assert result == str(output)
+        assert output.read_bytes() == b"data"
+
+        cookies = captured["cookies"]
+        assert cookies.get("SID", domain=".google.com") == "sid-value"
+        assert cookies.get("SID", domain=".googleusercontent.com") == "sid-value"
+        for domain in (".google.com", ".googleusercontent.com"):
+            assert cookies.get("OSID", domain=domain) is None
+            assert cookies.get("__Secure-OSID", domain=domain) is None
+
+        headers = captured["headers"]
+        assert headers.get("Sec-Fetch-Site") == "cross-site"
+        assert headers.get("Referer") == f"{mixin._get_base_url()}/"

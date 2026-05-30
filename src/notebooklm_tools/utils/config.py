@@ -20,6 +20,35 @@ from pydantic import BaseModel, Field
 STORAGE_DIR_NAME = ".notebooklm-mcp-cli"
 
 
+def safe_mkdir(
+    path: Path, *, parents: bool = False, exist_ok: bool = True, mode: int = 0o777
+) -> None:
+    """Create a directory, working around Python 3.14 Windows regression.
+
+    On Python 3.14 + Windows, ``pathlib.mkdir(parents=True, exist_ok=True)``
+    can raise ``FileExistsError`` (WinError 183) even when the directory
+    already exists.  This wrapper catches that specific failure.
+    See: https://github.com/jacob-bd/notebooklm-mcp-cli/issues/169
+    """
+    try:
+        path.mkdir(parents=parents, exist_ok=exist_ok, mode=mode)
+    except FileExistsError:
+        if path.is_dir():
+            return
+        raise
+    except PermissionError:
+        raise PermissionError(
+            f"Cannot write to {path} — permission denied.\n"
+            f'On Windows, fix with: icacls "{path.parent}" /grant %USERNAME%:(OI)(CI)F /t'
+        ) from None
+
+
+_ALLOWED_BASE_HOSTS = {
+    "notebooklm.google.com",
+    "notebooklm.cloud.google.com",
+}
+
+
 def get_base_url() -> str:
     """Get the NotebookLM base URL.
 
@@ -27,7 +56,15 @@ def get_base_url() -> str:
     Set NOTEBOOKLM_BASE_URL to override, e.g. for enterprise:
         export NOTEBOOKLM_BASE_URL=https://notebooklm.cloud.google.com
     """
-    return os.environ.get("NOTEBOOKLM_BASE_URL", "https://notebooklm.google.com").rstrip("/")
+    url = os.environ.get("NOTEBOOKLM_BASE_URL", "https://notebooklm.google.com").rstrip("/")
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or parsed.hostname not in _ALLOWED_BASE_HOSTS:
+        raise ValueError(
+            f"NOTEBOOKLM_BASE_URL must use https and one of: {_ALLOWED_BASE_HOSTS}. Got: {url}"
+        )
+    return url
 
 
 def get_default_language() -> str:
@@ -50,7 +87,7 @@ def get_storage_dir() -> Path:
     else:
         storage_dir = Path.home() / STORAGE_DIR_NAME
 
-    storage_dir.mkdir(exist_ok=True)
+    safe_mkdir(storage_dir, mode=0o700)
     return storage_dir
 
 
@@ -67,14 +104,14 @@ def get_data_dir() -> Path:
 def get_profiles_dir() -> Path:
     """Get the profiles directory path."""
     profiles_dir = get_storage_dir() / "profiles"
-    profiles_dir.mkdir(exist_ok=True)
+    safe_mkdir(profiles_dir)
     return profiles_dir
 
 
 def get_profile_dir(profile_name: str = "default") -> Path:
     """Get directory for a specific profile."""
     profile_dir = get_profiles_dir() / profile_name
-    profile_dir.mkdir(parents=True, exist_ok=True)
+    safe_mkdir(profile_dir, parents=True)
     return profile_dir
 
 
@@ -98,8 +135,51 @@ def get_chrome_profile_dir(profile_name: str = "default") -> Path:
 
     # New multi-profile structure
     chrome_dir = storage / "chrome-profiles" / profile_name
-    chrome_dir.mkdir(parents=True, exist_ok=True)
+    safe_mkdir(chrome_dir, parents=True)
     return chrome_dir
+
+
+def get_snap_chrome_profile_dir(
+    profile_name: str = "default",
+    snap_common: Path | None = None,
+) -> Path:
+    """Get a snap-accessible Chrome profile directory.
+
+    Snap packages (like snap Chromium) are confined by AppArmor and can
+    only write to ~/snap/<snap-name>/common/. This function returns a
+    profile directory inside that accessible location.
+
+    Args:
+        profile_name: NLM profile name
+        snap_common: Path to snap common directory (e.g., ~/snap/chromium/common)
+                     If None, auto-detects from installed snaps.
+
+    Returns:
+        Path to a snap-accessible Chrome profile directory.
+    """
+    if snap_common is None:
+        # Auto-detect snap common directory
+        for snap_name in ("chromium", "google-chrome"):
+            candidate = Path.home() / "snap" / snap_name / "common"
+            if candidate.exists():
+                snap_common = candidate
+                break
+
+    if snap_common is None:
+        # Fallback: use chromium common dir (create if needed)
+        snap_common = Path.home() / "snap" / "chromium" / "common"
+        safe_mkdir(snap_common, parents=True)
+
+    chrome_dir = snap_common / "notebooklm-mcp-cli" / "chrome-profiles" / profile_name
+    safe_mkdir(chrome_dir, parents=True)
+    return chrome_dir
+
+
+def get_firefox_profile_dir(profile_name: str = "default") -> Path:
+    """Get Firefox profile directory kept for backwards compatibility."""
+    firefox_dir = get_storage_dir() / "firefox-profiles" / profile_name
+    safe_mkdir(firefox_dir, parents=True)
+    return firefox_dir
 
 
 def get_config_file() -> Path:
@@ -325,7 +405,7 @@ class AuthConfig(BaseModel):
 
     browser: str = Field(
         default="auto",
-        description="Browser for auth: auto, chrome, arc, brave, edge, chromium, vivaldi, opera",
+        description=("Browser for auth: auto, chrome, arc, brave, edge, chromium, vivaldi, opera"),
     )
     default_profile: str = Field(default="default", description="Default profile name")
 
@@ -371,11 +451,11 @@ def load_config() -> Config:
 def save_config(config: Config) -> None:
     """Save configuration to file."""
     config_file = get_config_file()
-    config_file.parent.mkdir(parents=True, exist_ok=True)
+    safe_mkdir(config_file.parent, parents=True)
 
     # Convert to TOML format
     toml_content = _config_to_toml(config)
-    config_file.write_text(toml_content)
+    config_file.write_text(toml_content, encoding="utf-8")
 
 
 def _config_to_toml(config: Config) -> str:

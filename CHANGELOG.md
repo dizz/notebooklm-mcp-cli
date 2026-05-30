@@ -5,6 +5,338 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.13] - 2026-05-27
+
+### Security
+
+- **TOCTOU-safe credential file creation (PR #205)** — All credential files (`auth.json`, `cookies.json`, `metadata.json`, port map) were previously written with default permissions and then `chmod`'d to `0o600` — leaving a brief window where the file was world-readable. Fixed using `os.open()` + `os.fdopen()` so the file descriptor is created with `0o600` from the start. Thanks to **@Amy-Ra-lph** for the PR and thorough implementation!
+- **HTTP and SSE external-bind enforcement** — Running `notebooklm-mcp --transport http --host 0.0.0.0` (or `--transport sse`) previously emitted a warning but still bound to the external address. The server now refuses to start unless `NOTEBOOKLM_ALLOW_EXTERNAL_BIND=1` is explicitly set, preventing accidental cookie exposure on untrusted networks. The guard now covers both HTTP and SSE transports.
+- **GitHub Actions pinned to full commit SHAs (PR #207)** — All four workflow files now pin third-party actions (`actions/checkout`, `astral-sh/setup-uv`, `pypa/gh-action-pypi-publish`, `softprops/action-gh-release`) to their full 40-character commit SHAs with a version comment for readability. Prevents tag-drift supply chain attacks. Thanks to **@Amy-Ra-lph** for the careful SHA verification!
+
+### Fixed
+
+- **`terminate_chrome()` null-safety (PR #205)** — On double-call, `_cached_ws.close()` could raise `AttributeError` because `_cached_ws` was read after being set to `None`. The reference is now captured before the try block. Thanks to **@Amy-Ra-lph**!
+- **Cookie key whitespace handling (PR #205)** — Added `.strip()` to cookie key parsing in `save_auth_tokens` to handle edge cases with leading/trailing whitespace in cookie headers.
+- **Auth check consistency (PR #203)** — Unified auth checking logic under a single `check_auth()` function with a typed `AuthCheckResult`, eliminating subtle differences between the MCP and CLI auth status paths. Thanks to **@derekszen** for the clean refactor!
+
+### Changed
+
+- **Exponential backoff for source reconciliation polling** — `_reconcile_source()` (the fallback poller that verifies a source landed after an ambiguous gRPC error) previously used a fixed 1-second delay between polls. Now uses exponential backoff (1s → 2s → 4s, capped at 4s) to reduce unnecessary API calls on slower operations.
+- **File path canonicalization for uploads** — `add_file()` now calls `.expanduser().resolve()` on the input path, so paths like `~/Documents/file.pdf` work correctly and symlinks are fully resolved before validation.
+- **`raw_response` field removed from `query()` return** — The `raw_response` key was included in the dict returned by `ConversationMixin.query()` but was never read by any caller (services, MCP tools, or CLI). Removing it avoids leaking raw API response text into any future log aggregators or serializers.
+
+## [0.6.12] - 2026-05-24
+
+### Fixed
+
+- **Manual login Netscape cookie parser fixes (PR #199 / Issue #198)** — Fixed three bugs in the Netscape/Mozilla cookie file parser used in `nlm login --manual`:
+  * Resolved a critical bug that treated `#HttpOnly_` lines as comment rows and silently ignored them, which dropped essential Google authentication cookies like `__Secure-1PSIDTS` and `__Secure-3PSIDTS` (resulting in cryptic 401 errors).
+  * Allowed empty-value cookies to be parsed with a value of `""` instead of being skipped by ensuring trailing tab characters are not stripped from the end of the line.
+  * Hardened value extraction to defensively join tab-containing cookie values instead of truncating them.
+  * Added 4 new test cases to prevent future regressions. Thanks to **@pan-long** for the comprehensive PR and excellent troubleshooting!
+- **MCP `source_add` tool and `SKILL.md` file-type alignment (PR #197)** — Updated the `source_add` MCP tool docstring and the global `SKILL.md` guidelines to list all 18 supported file-type extensions (`PDF, TXT, MD, DOCX, CSV, EPUB, MP3, M4A, WAV, AAC, OGG, OPUS, MP4, JPG, JPEG, PNG, GIF, WEBP`) instead of a restricted subset. Also documented how image-bearing sources are ingested to feed the Studio video generation's visual-crop pipeline to generate on-screen visual aids in Video Overviews. Thanks to **@Premshay** for the excellent documentation enhancement and detailed research on the visual-crop pipeline!
+
+## [0.6.11] - 2026-05-22
+
+### Fixed
+
+- **False-negative errors on `source_add` and `research_import` (Issue #196)** — `source_add` (text, URL, Drive) and `research_import` were reporting `"Could not add ... source."` errors even when NotebookLM had successfully accepted the source for asynchronous processing. Root cause: NotebookLM uses the same gRPC error code `3` in the `wrb.fr` response envelope for both "accepted-pending" (async processing started) and "genuine rejection". Added a `_reconcile_source()` helper that polls `get_notebook_sources_with_types()` after a code 3 or 9 error to verify whether the source actually landed. If found → returns success. If not found after polling → re-raises the original error so genuine failures still surface. Also fixed a secondary double-submission bug where URL sources on accounts using the v1 (`izAoDd`) RPC would trigger a spurious v2 (`ozz5Z`) call when v1 returned an accepted-pending code 3 — reconciliation now short-circuits the fallback if v1 actually delivered. 12 new unit tests added (total: 875 tests). Thanks to **@mdshearer** for the detailed report and excellent root cause analysis!
+- **Snap Chromium profile directory (PR #195)** — On Ubuntu and other distros, Chromium installed as a Snap package is confined by AppArmor and can only write to `~/snap/<snap-name>/common/`. Launching with `--user-data-dir=~/.notebooklm-mcp-cli/` was failing with `Exit code 21: Failed to create a ProcessSingleton`. Snap browsers are now detected via `/snap/` in the resolved binary path and automatically redirected to `~/snap/chromium/common/notebooklm-mcp-cli/chrome-profiles/`. Profile lock, headless auth, and cache cleanup are all snap-aware. Thanks to **@ildella** for the contribution!
+- **Audio download 403 on cross-domain CDN (PR #193)** — Audio artifacts downloaded via `nlm download audio` were returning HTTP 403 from Google's CDN (`lh3.google.com`) because `_download_url` inherited `Sec-Fetch-Site: none` from the page fetch headers. Google's audio CDN treats that value as an unauthorized address-bar navigation and rejects the request regardless of valid cookies. The fix mirrors the header shape Chrome uses for `window.open()` — setting `Sec-Fetch-Site: cross-site` and `Referer: https://notebooklm.google.com/` on all cross-domain artifact downloads. Verified: same notebook that returned `"Download failed for audio."` now produces a complete 41.7 MB AAC file. Thanks to **@responsiblefleet** for the thorough root cause analysis and fix!
+
+## [0.6.10] - 2026-05-15
+
+### Fixed
+
+- **Windows CDP Authentication Reliability (#192)** — Major stability improvements for authentication on Windows 11. Thanks to **@jonathanzhan1975** for the detailed bug report and testing!
+    - Improved Windows Edge detection logic in `nlm doctor` to match the login flow.
+    - Optimized CDP port scan timeouts (reduced from 2s to 1s) to prevent 20-second blocks when ports are unresponsive.
+    - Added process isolation for Windows via `CREATE_NEW_PROCESS_GROUP`.
+    - Added `--disable-features=msEdgeStartupBoost` launch flag to prevent Edge's "Startup Boost" background processes from intercepting CDP sessions.
+    - Implemented automated cleanup of stale NLM-spawned browser processes.
+    - Enhanced failure diagnostics to log process exit codes when browser initialization fails.
+
+## [0.6.9] - 2026-05-11
+
+### Added
+
+- **Hermes Agent Support** — `nlm skill install hermes` now installs the NotebookLM skill for [Hermes Agent](https://github.com/NousResearch/hermes-agent) by NousResearch. Respects the `$HERMES_HOME` environment variable for custom install paths.
+- **EPUB File Upload Support (PR #191)** — `.epub` files can now be uploaded as notebook sources. Thanks to **@mateogon** for the contribution!
+
+### Fixed
+
+- **Windows Tool Detection** — `nlm skill install` no longer falsely warns that tools are not installed on Windows. Detection now checks for the tool's binary on PATH and root config directory existence instead of only checking the (possibly non-existent) skills subdirectory.
+- **Windows Permission Errors** — `safe_mkdir` now catches `PermissionError` and provides an actionable fix command (`icacls`) instead of a raw traceback. The update-check cache and `print_update_notification()` no longer crash the CLI when the storage directory has restrictive ACLs.
+- **Windows Encoding Errors** — All `read_text()` / `write_text()` calls now explicitly specify `encoding="utf-8"` to prevent `UnicodeDecodeError` on Windows systems that default to `cp1252`.
+- **CLI Studio Status Missing Mind Maps** — `nlm studio status` now routes through the service layer (`get_studio_status`) so mind maps are included in the output.
+
+### Changed
+
+- **Shared Tool Detection** — Extracted `is_tool_on_system()` helper into `cli/utils.py`, shared by both `nlm skill install` and `nlm setup` to eliminate duplicate detection logic.
+- **Typed Skill Config** — `TOOL_CONFIGS` in `skill.py` now uses a `ToolConfig` `TypedDict` instead of `dict[str, Any]` for better type safety.
+- **File Upload Docs** — Updated supported file types list to include `.epub` and all audio/image formats actually supported by the API.
+
+---
+
+## [0.6.8] - 2026-05-11
+
+### Fixed
+
+- **Conversation Query Rejection** — Fixed an issue where the notebook query endpoint would reject requests with an opaque error due to strict backend requirements. Explicitly added `Content-Type: application/x-www-form-urlencoded;charset=UTF-8` to the streamed query endpoint. Thanks to **@fabianafurtadoff** for the contribution (PR #189)!
+
+## [0.6.7] - 2026-05-10
+
+### Added
+
+- **Cited-Only Filtering for Research** — Added support for filtering out non-cited sources during research imports. This includes a robust citation parser that handles standard markers (`[1]`), ranges (`[4-6]`), and bibliography extraction. The `research_status` polling output now also annotates sources with a `cited: bool` field for visibility. Thanks to **@zxyasfas** for the contribution (PR #188)!
+
+### Fixed
+
+- **Audio Download Extension Validation (Issue #185)** — `nlm download audio` now rejects incompatible file extensions (like `.mp3` or `.wav`) instead of writing AAC data with the wrong file extension. A helpful hint now suggests using `.m4a` or `.mp4` and provides an `ffmpeg` command for conversion.
+- **Conversation Query Hangs** — Replaced direct `client.post()` with a fresh `httpx.Client()` context in conversation queries to prevent internal connection pool exhaustion or unexpected hangs during repeated querying.
+- **Fuzzy Title Matching in Research** — Upgraded the research citation title matcher from basic substring checks to whitespace-aware boundary regex, preventing false positives where a short title matches a substring of a longer word.
+
+---
+
+## [0.6.6] - 2026-05-07
+
+### Fixed
+
+- **Opaque error on capacity throttle (Issue #182)** — When NotebookLM returns `RPCError code=8` (RESOURCE_EXHAUSTED) with a `UserDisplayableError` payload, the error message now surfaces the human-readable text instead of the raw protobuf type URL. Added `ResourceExhaustedError(RPCError)` subclass so callers can catch throttle errors distinctly. Studio artifact creation now provides retry-specific hints. Thanks to **@nikolaykazakovvs-ux** for the detailed report!
+
+- **Cinematic video silently ignores --style-prompt (Issue #183)** — `--style-prompt` with cinematic format now maps to `custom_instructions` (same API field as the web UI's "Customize Video Overview" dialog) instead of being silently dropped. `--style` still rejects for cinematic since visual style codes don't apply. Validation now runs before source resolution for faster feedback. Thanks to **@guia-matthieu** for the report!
+
+### Changed
+
+- Updated README to note Google AI Ultra ($249/mo) compatibility (PR #184). Thanks to **@guia-matthieu**!
+
+---
+
+## [0.6.5] - 2026-05-05
+
+### Fixed
+
+- **Authentication Race Condition (Issue #181)** — Fixed an issue where the `nlm login` CLI and headless authentication flows exited prematurely, resulting in incomplete cookie extraction and subsequent "Authentication expired" errors. Implemented deterministic DOM polling to wait for session tokens (`FdrFJe` or build label) before extracting cookies.
+
+---
+
+## [0.6.4] - 2026-05-04
+
+### Fixed
+
+- **Cross-domain artifact downloads (PR #180)** — Fixed an authentication bug where `OSID` cookies leaked during cross-domain artifact downloads, causing `ServiceLogin` redirects. The `_download_url` method now correctly strips service-scoped cookies for external hosts. Thanks to **@laofun** for this critical fix!
+
+---
+
+## [0.6.3] - 2026-05-04
+
+### Fixed
+
+- **CDP tab creation failures in locked-down environments (Issue #175)** — Added fallbacks to reuse existing tabs if CDP tab creation fails. Removed redundant page fetch and merged reuse loops into one pass.
+
+---
+
+## [0.6.2] - 2026-04-29
+
+### Fixed
+
+- **Login timeout after Google sign-in (#174)** — `is_logged_in()` used substring matching on the full URL, so the post-sign-in redirect URL containing `original_referer=...accounts.google.com...` in the query string was misidentified as a sign-in page. Now parses the URL hostname via `urlparse()`. Thanks to **@SKMKZP** for the clear root cause analysis and fix!
+- **Headless browser hijacking during `nlm login`** — `find_any_existing_cdp_browser()` would blindly reuse any Chrome with CDP enabled on ports 9222-9231, including headless instances from other tools (e.g. Perplexity MCP). This caused `nlm login` to silently hang for 5 minutes waiting for sign-in on an invisible browser. Now checks User-Agent for `HeadlessChrome` and skips automation browsers.
+- **Silent login wait loop** — When waiting for user sign-in, the CLI now emits status messages instead of hanging silently for up to 5 minutes with no feedback.
+
+### Changed
+
+- Extracted `_fetch_cdp_version()` helper to share `/json/version` logic between `get_debugger_url()` and `find_any_existing_cdp_browser()`.
+
+---
+
+## [0.6.0] - 2026-04-27
+
+### Added
+
+- **Source Label Management** — Organize notebook sources into thematic categories with the new `label` MCP tool and `nlm label` CLI commands. Full action set: `auto` (AI-generated labels), `list`, `create`, `rename`, `set_emoji`, `move_source`, and `delete`. Multi-label assignment supported — sources can belong to more than one label. Requires 5+ sources for auto-labeling.
+
+### Fixed
+
+- **WSL Firewall check encoding (#172)** — PowerShell on Windows commonly returns output in UTF-16-LE, causing a `UnicodeDecodeError` in `check_firewall_rule()` that made `nlm login --wsl` show a false firewall warning even when the rule already existed. Fixed by adding `errors="replace"` to the subprocess call. Thanks to **@andrepreira** for the diagnosis and clean fix!
+
+---
+
+## [0.5.31] - 2026-04-26
+
+### Fixed
+- **EOF on Initialization (Issue #171)** — The MCP `stdio` transport strictly requires `stdout` to be used *only* for JSON-RPC messages. `fastmcp` initialization logs (and any other stray `print()` calls) were corrupting the `stdout` stream, causing MCP clients to crash with an EOF error on Windows and macOS. Added a dedicated `_StdoutToStderrWrapper` in `server.py` that intercepts all standard text output and safely redirects it to `stderr`, while preserving the underlying binary `.buffer` for valid JSON-RPC payloads. Thanks to **@swiezaczek** for the thorough analysis in the issue report!
+
+## [0.5.30] - 2026-04-25
+### Fixed
+- **Auth loop when `NOTEBOOKLM_COOKIES` env var is stale (Issue #170)** — `refresh_auth` now detects when `NOTEBOOKLM_COOKIES` is set in the environment and returns a clear, actionable error instead of falsely reporting "success" while silently reloading the same stale cookies. Auth failure messages now include a note pointing to the env var when it's the likely cause. Thanks to **@nobolso** for the thorough root cause analysis!
+- **Deprecated `NOTEBOOKLM_CSRF_TOKEN` / `NOTEBOOKLM_SESSION_ID` env vars removed** — These were still being read and passed to the client constructor, which caused them to bypass auto-refresh when stale. Both are now always auto-extracted; the deprecated env vars are ignored.
+
+### Documentation
+- Added troubleshooting section to `AUTHENTICATION.md` explaining the `NOTEBOOKLM_COOKIES` env var override trap, how to diagnose it, and both fix options.
+
+## [0.5.29] - 2026-04-24
+
+### Fixed
+- **Python 3.11 TypedDict compatibility (Issue #167)** — Pydantic v2 rejects `typing.TypedDict` on Python < 3.12. All 13 service files now import `TypedDict` from a centralized compat shim (`services/_compat.py`) that uses `typing_extensions` on < 3.12. Added `typing_extensions` as an explicit dependency for Python < 3.12. Thanks to **@irvinghu07** for the clear report and suggested fixes!
+- **SOCKS proxy blocks `nlm login` (Issue #167)** — The CDP helper's `httpx.Client` inherited `ALL_PROXY` from the environment, causing `ImportError: socksio not installed` on localhost CDP connections. Fixed with `trust_env=False`. Thanks to **@irvinghu07**!
+- **MCP `notebook_list` always returns "Authentication expired" (Issue #169)** — `save_tokens_to_cache()` only wrote to the legacy `auth.json`, but `load_cached_tokens()` prioritizes `profiles/default/cookies.json`. Tokens saved via the MCP `save_auth_tokens` tool were never read back. Fixed by syncing writes to both `auth.json` and the active profile. Thanks to **@nobolso** for the thorough diagnosis and file structure analysis!
+- **Python 3.14 Windows `pathlib.mkdir` regression (Issue #169)** — `Path.mkdir(parents=True, exist_ok=True)` raises `FileExistsError` (WinError 183) on Python 3.14 + Windows. Added `safe_mkdir()` wrapper applied to all `mkdir` calls across `config.py`, `auth.py`, `base.py`, and `cdp.py`. Thanks to **@nobolso**!
+
+## [0.5.28] - 2026-04-23
+
+### Fixed
+- **HTTP transport: default to stateless mode (Issue #165)** — HTTP transport (`--transport http`) now defaults to stateless sessions, preventing the MCP SDK double-response crash (`AssertionError: Request already responded to`) that killed entire sessions on slow Google API calls. Use `--no-stateless` to opt out. Thanks to **@mylaser215** for the thorough root cause analysis (#165)!
+
+### Changed
+- **CLI flags use `BooleanOptionalAction`** — `--stateless` / `--no-stateless` and `--debug` / `--no-debug` are now proper toggle pairs. Environment variables (`NOTEBOOKLM_MCP_STATELESS`, `NOTEBOOKLM_MCP_DEBUG`) accept `true/false/0/1/yes/no/on/off` (case-insensitive).
+
+### Documentation
+- **CLI Guide: document all skill install targets (Issue #163)** — Added `agents`, `codex`, `gemini-cli`, and `alef-agent` with install path details. Fixed missing `opencode` in setup clients list.
+
+## [0.5.27] - 2026-04-21
+
+### Added
+- **Restore skill targets for codex and gemini-cli (Issue #163)** — Restored the missing target configurations for `codex` and `gemini-cli` agent skills and added Alef Agent specific frontmatter logic. Thanks to the user who reported this issue (#163)!
+
+### Fixed
+- **Source: Honour `--title` when adding a file source (PR #162)** — Fixed an issue where adding a file source via CLI ignored the user's custom title. The source upload is now fully awaited before the follow-up rename is fired to guarantee precision. Huge thanks to **@CryptoWombat** for this excellent contribution and thorough fix!
+
+## [0.5.26] - 2026-04-17
+
+### Added
+- **`server_info` reports local auth state (Issue #160)** — Response includes `auth_status` (`configured` | `stale` | `not_configured` | `error`) based on cached token presence and age. This is a local disk check only, not a live Google validation; docstring clarifies. Thanks to **@josuebustosn** for the report and expected behavior.
+
+### Fixed
+- **Windows Unicode: all CLI Rich consoles use safe factory (Issue #156)** — Every CLI command module and the default `Formatter` now use `make_console()` (`safe_box`, `legacy_windows=False` on Windows) instead of bare `Console()`. Complements the UTF-8 stdio bootstrap from v0.5.25 and avoids `UnicodeEncodeError` / MCP EOF on legacy Windows code pages when printing API text with arrows, smart quotes, etc. Thanks again to **@argonaut-cm** for the original EOF / Unicode analysis (v0.5.25 thanked the stdio + Rich bootstrap; this completes CLI-wide coverage).
+- **MCP reloads client after `nlm login` without manual `refresh_auth` (Issue #161)** — `get_client()` now invalidates the singleton when on-disk tokens are newer than the running client (`extracted_at` vs `_created_at`), not only when the cookie dict changes. Same-profile re-auth updates are picked up automatically. Auth expiry error message mentions `refresh_auth` as a fallback. Thanks to **@josuebustosn** for the clear repro and suggested directions.
+
+## [0.5.25] - 2026-04-15
+
+### Fixed
+- **Audio download fails with 302→404 (Issue #158)** — Google's audio media list contains multiple URL variants: `=m140-dv` (download variant, fast CDN via `drum.usercontent.google.com`, ~3 MB/s) and `=m140` (streaming transcode via `googlevideo.com`, ~30 KB/s). The download logic now explicitly prefers the `-dv` variant for both `download_audio` and `_extract_audio_media_url`. Audio downloads that previously failed now complete a 47MB file in ~15 seconds. Thanks to **@Victor777777** for the detailed bug report and redirect chain analysis!
+- **CDP WebSocket broken with system proxy (Issue #119, PR #157)** — When `HTTP_PROXY` / `HTTPS_PROXY` environment variables are set (e.g., Clash, Surge), `websocket-client` routed localhost CDP connections through the external proxy, crashing `nlm login`. Fixed by temporarily clearing proxy env vars around `websocket.create_connection` in `execute_cdp_command`. The existing httpx fix (#119) only covered HTTP; this completes the WebSocket side. Thanks to **@ahmelkholy** for identifying the issue and contributing PR #157!
+- **Windows: MCP server crashes with UnicodeEncodeError (Issue #156)** — On Windows consoles using cp1252 encoding, Rich's legacy renderer crashed on Unicode characters like `→` (U+2192) returned by NotebookLM, killing the MCP server process and causing client EOF disconnects. Fixed by reconfiguring `stdout`/`stderr` to UTF-8 with replacement at process startup (both CLI and MCP entry points) and setting `legacy_windows=False` on Rich Console instances. Thanks to **@argonaut-cm** for the clear traceback and proposed solutions!
+
+### Changed
+- **Lazy-load `NotebookLMClient` in package `__init__`** — `from notebooklm_tools import NotebookLMClient` now uses `__getattr__` to defer the heavy import until first access, keeping the stdio encoding bootstrap lightweight.
+
+## [0.5.24] - 2026-04-13
+
+### Fixed
+- **Studio: Surface revise RPC errors with actionable hints (PR #154)** — When `slides revise` fails due to an invalid artifact ID or a rejected revision request, the error now surfaces the specific Google API error code (e.g., `INVALID_ARGUMENT`) along with a clear hint guiding the user to verify their artifact ID. Previously, these failures produced opaque, unhelpful error messages. Thank you **@sickn33** for this fix!
+- **WSL2: Auth broken on Chrome 136+ due to localhost-only CDP (PR #155)** — Chrome 136+ ignores `--remote-debugging-address=0.0.0.0`, restricting the DevTools Protocol to `127.0.0.1` only. This completely broke `nlm login --wsl` for all WSL2 users. The fix switches to a port proxy approach: Chrome launches on port 9223 (localhost) and WSL connects via port 9222 through a `netsh interface portproxy` rule. Temp Chrome profiles are now created on the Windows filesystem (`%TEMP%`) instead of WSL's `/tmp` to prevent "Profile error occurred" crashes. Updated `docs/WSL_SETUP.md` with one-time setup instructions. Thank you **@casjogreen** for this critical fix!
+
+## [0.5.23] - 2026-04-12
+
+### Added
+- **Restore NotebookLM MCP and CLI runtime contracts (PR #152)** — Fixed MCP tool boundary registration, normalized error payloads, and restored download/upload sync-compatible entrypoints. Thank you **@sickn33** for this immense contribution!
+
+### Fixed
+- **Windows: Server crashes immediately on startup (Issue #150)** — `os.execvp` fails on Windows. Replaced with `subprocess.run` to prevent immediate crashes on Windows 11 during server startup via the `.mcpb` bundle. Added explicit `stdin=sys.stdin`, `stdout=sys.stdout`, and `stderr=sys.stderr` to ensure the JSON-RPC stdio channel between Claude Desktop and the server remains properly connected across platforms. Thanks to **@m3saros** for diagnosing the root cause and providing the exact fix!
+
+## [0.5.22] - 2026-04-11
+
+### Added
+- **Studio status code parity and normalization (PR #149)** — Consolidated the extraction logic for studio artifacts into a centralized `_normalize_studio_status` routine. The `JsonFormatter` has been updated to dynamically populate returned JSON payloads with newly available artifact fields (such as `audio_url`, `video_url`, `slide_deck_url`, `flashcard_count`) without breaking the shape expected by downstream consumers. Huge thanks to **@sickn33** for this amazing contribution!
+
+### Fixed
+- **API `poll_studio_status` bypassing auth recovery** — The core `poll_studio_status` helper function was making raw HTTP calls and dodging the standard `_call_rpc` pipeline. This caused it to immediately fail on `400 Bad Request` exceptions whenever the user's `build_label` or session tokens went stale. The polling function now correctly wraps its logic in `_call_rpc`, securing free auth recovery loops, retries, and unified debug capability during studio polling.
+
+## [0.5.21] - 2026-04-11
+
+### Fixed
+- **HTTP 400 bad request causing silent auth failures (Issue #147)** — Google returns `400 Bad Request` instead of `401` or `403` when the internal CSRF token expires. Added 400 to the retryable auth status codes, which fixes auth recovery failures and prevents tracebacks (PR #148).
+- **WSL CDP failures breaking auth (Issue #138, #144)** — Native WSL connectivity has been fully added. `nlm login --wsl` securely launches and channels DevTools via `0.0.0.0` to safely bridge the WSL network boundary.
+- **Pass Build Label in login check** — The `nlm login --check` command was initiating a client without passing the configured build label, unnecessarily triggering a three-month backward fallback.
+
+## [0.5.20] - 2026-04-10
+
+### Fixed
+- **`nlm create infographic` crash when `--style` not specified (Issue #142)** — The verb-first route was missing the `--style` option entirely, causing a `TypeError` on invocation. Fixed alongside 12 other missing parameters across verb-first wrappers.
+- **Multiple verb-first commands missing parameters** — The verb-first CLI route (`nlm create`, `nlm add`, `nlm describe`, `nlm query`, `nlm delete`) was missing 13 parameters that existed on the noun-first route: `--focus` on `nlm create quiz` and `nlm create flashcards`; `--wait` and `--wait-timeout` on `nlm add url`, `nlm add text`, and `nlm add drive`; `--auto-import` on `nlm research start`; `--format` on `nlm download slides`; `--json` on `nlm describe notebook`, `nlm query notebook`, and `nlm source content`; and `--confirm` on `nlm delete alias`.
+
+### Changed
+- **Widened `fastmcp` dependency to `>=2.0.0,<4.0` (Issue #141)** — The previous upper bound (`<3.0`) caused a startup crash when `fakeredis 2.35.0` was installed alongside `fastmcp 2.x`. Widening to `<4.0` resolves the incompatibility and allows users to use newer FastMCP releases without version conflicts.
+
+### Added
+- **Parameter parity test (`tests/cli/test_verbs_parity.py`)** — Automatically compares every verb-first wrapper in `cli/commands/verbs.py` against its target function to detect missing parameters. CI will now fail if a verb wrapper drifts out of sync with its noun-first counterpart.
+
+## [0.5.19] - 2026-04-09
+
+### Added
+- **Auto-Import for Research** — Added `--auto-import` / `--wait-and-import` flags to `nlm research start` to automatically wait for research to finish and immediately import.
+
+### Fixed
+- **Deep Research Task ID Mismatch (Issue #140)** — Fixed a bug where deep research task IDs were being mutated by the backend and causing import failures. The CLI now polls the correct mutated task ID before issuing the import command.
+- **Empty Notebook Error Mapping** — When attempting to query a notebook with 0 sources, the backend previously threw an unhelpful `API error (code 5): unknown`. This now returns a clean validation error indicating the notebook is empty and needs sources added.
+- **gRPC Error Code Mapping** — Generic undocumented gRPC error codes from Google's batchexecute API (like 5, 7, 16) are now mapped to their standard names (`NOT_FOUND`, `PERMISSION_DENIED`, etc.) instead of logging as `unknown`.
+
+## [0.5.18] - 2026-04-09
+
+### Added
+- **WSL2 Authentication Support (PR #138)** — New `nlm login --wsl` flag launches Windows Chrome from WSL2 for seamless authentication. Includes automatic firewall rule management, cross-boundary CDP communication, and a cleanup mechanism for temporary Chrome profiles. Full setup guide at `docs/WSL_SETUP.md`. Thanks to **@kylebrodeur** for the comprehensive implementation!
+- **WSL2 Diagnostics** — `nlm doctor` now detects WSL2 environments and reports Chrome availability, Windows interop status, and firewall configuration.
+
+### Fixed
+- **Thread-Safety for Concurrent MCP Tool Calls (PR #135)** — Added `threading.Lock` to `BaseClient` protecting mutable state (`_reqid_counter`, `_conversation_cache`, `_source_rpc_version`) from race conditions during parallel MCP tool invocations. Uses double-checked locking for singleton client initialization. Includes 7 new concurrent access tests. Thanks to **@xiangyuwang1998** for the implementation!
+- **Restored CDP WebSocket Timeout** — Re-applied the 30-second timeout on `execute_cdp_command()` that was inadvertently removed during the WSL2 merge. Prevents infinite hangs on stale/dropped WebSocket connections.
+- **Restored Port Map File Permissions** — Re-applied `chmod 0o600` on the port map file that was inadvertently removed during the WSL2 merge. Ensures the port map is only readable by the owner.
+
+## [0.5.17] - 2026-04-07
+
+### Security
+- **CDP Origin Restriction (PR #133)** — Chrome is now launched with `--remote-allow-origins` restricted to `localhost` and `127.0.0.1` only, preventing malicious webpages from connecting to the CDP debug port. Previously allowed all origins (`*`). Thanks to **@wccheung11011001** for the security audit!
+- **Base URL Allowlist (PR #133)** — The `NOTEBOOKLM_BASE_URL` environment variable is now validated against an allowlist of known Google domains (HTTPS only), preventing cookie exfiltration via environment injection.
+- **Download Path Traversal Protection (PR #133)** — Added `validate_output_path()` to block downloads from writing to sensitive directories (`.ssh`, `.gnupg`, `.aws`, `.kube`, `.claude`, `.config`) or overwriting sensitive files (`authorized_keys`, `id_rsa`, `.bashrc`, etc.).
+- **File Permission Hardening (PR #133)** — Auth-related files, debug output, and the port map are now created with restrictive permissions (`0o600` for files, `0o700` for the storage directory). Thanks to **@wccheung11011001**!
+- **CDP WebSocket Timeout (PR #133)** — Added a 30-second timeout to CDP WebSocket commands to prevent infinite blocking on stale or dropped connections.
+
+### Added
+- **Custom Visual Style Prompts for Video (PR #131)** — You can now pass a custom style description when creating videos with `--style custom --style-prompt "your description"` (CLI) or `video_style_prompt` (MCP). The style prompt is also returned in studio status responses. Thanks to **@agarwalvipin** for the implementation and live API verification!
+- **Audio Source Support (PR #134)** — `nlm source add --file` now correctly handles audio uploads (m4a, wav, mp3). Audio sources use type code 10, which was previously unrecognized. The `--wait` flag now handles audio's transient status 3 state (which is not a hard failure for audio, unlike other source types) and a new `--wait-timeout` flag (default 600s) gives long recordings enough time to finish transcribing. Thanks to **@stanleykao72** for the thorough investigation and fix!
+- **CONTRIBUTING.md** — Added a contributor guide covering architecture rules, the Chrome DevTools API capture workflow, testing requirements (both CLI and MCP), security guidelines, error handling patterns, and PR expectations.
+
+### Fixed
+- **`build_label` Data Loss (PR #133)** — `Profile.to_dict()` was silently dropping the `build_label` field, causing it to be lost across restarts and re-fetched from scratch. Now properly persisted. Thanks to **@wccheung11011001**!
+- **Ruff Lint and Format Violations** — Fixed `B904` exception chaining in CDP timeout handler, and resolved format violations in `sources.py`, `config.py`, `test_url_source_fallback.py`, and `test_studio.py`.
+
+## [0.5.16] - 2026-04-04
+
+### Fixed
+- **URL Source Addition Failing with INVALID_ARGUMENT (Issue #121)** — Fixed `source_add` (URL type) failing with `RPC error code 3 (INVALID_ARGUMENT)` for some users due to Google migrating the `add_source` endpoint. Implemented a dual-RPC fallback: the system tries the legacy `izAoDd` endpoint first, and if it returns code 3, automatically retries with the new `ozz5Z` endpoint. The working endpoint is cached per session to avoid extra round-trips on subsequent calls. Both single and bulk URL additions (`url` and `urls` parameters) benefit from the fallback. Thanks to **@Neophen** for reporting!
+
+### Added
+- **19 new unit tests** for dual RPC fallback mechanism (total: 704 tests)
+
+## [0.5.15] - 2026-04-02
+
+### Added
+- **Async Query Polling (Issue #125)** — New `notebook_query_start` and `notebook_query_status` MCP tools for querying large notebooks (50+ sources) without hitting MCP client timeouts. `notebook_query_start` fires the query in a background thread and returns immediately with a `query_id`. Poll `notebook_query_status` with the `query_id` to get the result when ready. Includes automatic TTL cleanup (10 min) for stale entries. The existing `notebook_query` tool remains unchanged for backward compatibility.
+- **10 new unit tests** for async query lifecycle (total: 685 tests)
+
+## [0.5.14] - 2026-04-01
+
+### Fixed
+- **Research Start Dead Parameter (Issue #123)** — Fixed a bug where `nlm research start "query" --title "My Title"` (and the corresponding MCP tool parameter `title`) failed because the internal logic did not automatically trigger new notebook creation when `title` was provided without a `notebook_id`.
+
+## [0.5.13] - 2026-03-31
+
+### Fixed
+- **Python 3.13 Crash in `nlm skill` (Issue #122)** — Fixed a crash when running `nlm skill install` on Python 3.13, which was caused by using `@click.option(type=Literal["user", "project"])`. Replaced with standard string validation. Thanks to **@zhaoguoqiao** for reporting!
+- **CDP Proxy Bypass (Issue #119)** — The `httpx` HTTP2 client was honoring system proxy settings even for the internal `127.0.0.1` CDP WebSocket acquisition call (`http://127.0.0.1:9222/json`). This caused connections to fail on machines running proxies. Restored the `proxy=None` argument to explicitly bypass proxies for local loopback connections. Thanks to **@sjs33** for discovering and reporting this!
+- **`research_status` Polling Loop (PR #120)** — Restored the internal polling loop for `research_status` when `max_wait` is set. Previously, the parameters were ignored after a refactor, and it always returned after a single check. The tool now correctly blocks and polls until the research is completed or times out. Thanks to **@byingyang** for the excellent bug report, full implementation, and test suite!
+
+## [0.5.12] - 2026-03-30
+
+### Fixed
+- **Auth recovery skips profile-based cookies (Issue #117, Bug 1)** — `_try_reload_or_headless_auth()` gated Layer 2 recovery on `auth.json` existence. If the legacy file didn't exist, valid profile-based credentials in `profiles/default/cookies.json` were completely skipped, falling straight through to headless auth (Layer 3). Now always calls `load_cached_tokens()` which checks the profile directory first, then falls back to `auth.json`. Thanks to **@olaservo** for the incredibly detailed report!
+- **`--cdp-url` ignored by builtin provider (Issue #117, Bug 2)** — `nlm login --cdp-url http://127.0.0.1:9222` was ignored when using the default builtin provider, always launching a new Chrome instead. Now, when `--cdp-url` is explicitly provided (even with the builtin provider), the CLI auto-routes to the existing-CDP extraction path, matching the user's intent to connect to an already-running browser. Thanks again to **@olaservo**!
+- **Pre-existing lint errors blocking CI** — Fixed 3 lint violations (`SIM105` in `auth.py`, `I001` in `base.py`, `F401` in `test_coerce_list.py`) that were blocking the CI pipeline for PR #118.
+
+### Security
+- **Restrict `auth.json` file permissions (PR #116)** — Auth token cache files are now written with `chmod 600` (owner read/write only), preventing other local users or processes from reading active session cookies. Thanks to **@tody-agent** for the security audit!
+
 ## [0.5.11] - 2026-03-27
 
 ### Added

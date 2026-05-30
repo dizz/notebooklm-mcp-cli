@@ -2,10 +2,15 @@
 """StudioMixin for NotebookLM client - studio content creation and status."""
 
 import contextlib
+from typing import Any, Protocol, cast
 
 from . import constants
 from .base import BaseClient
 from .utils import parse_timestamp
+
+
+class _SourceLookupProtocol(Protocol):
+    def get_notebook_sources_with_types(self, notebook_id: str) -> list[dict[str, Any]]: ...
 
 
 class StudioMixin(BaseClient):
@@ -39,11 +44,121 @@ class StudioMixin(BaseClient):
             List of source UUIDs, or empty list if none found
         """
         try:
-            sources = self.get_notebook_sources_with_types(notebook_id)
+            source_client = cast(_SourceLookupProtocol, self)
+            sources = source_client.get_notebook_sources_with_types(notebook_id)
             return [s["id"] for s in sources if s.get("id")]
         except Exception:
             # Return empty list on error - caller methods will handle gracefully
             return []
+
+    def _audio_has_media_urls(self, artifact_data: list[Any]) -> bool:
+        """Return True when an audio artifact exposes playable/downloadable media URLs."""
+        if len(artifact_data) <= 6:
+            return False
+
+        audio_options = artifact_data[6]
+        if not isinstance(audio_options, list) or len(audio_options) <= 5:
+            return False
+
+        media_list = audio_options[5]
+        if not isinstance(media_list, list):
+            return False
+
+        return any(
+            isinstance(item, list)
+            and len(item) > 0
+            and isinstance(item[0], str)
+            and item[0].startswith("http")
+            for item in media_list
+        )
+
+    def _extract_audio_media_url(self, artifact_data: list[Any]) -> str | None:
+        """Extract the best available audio media URL from an audio artifact payload.
+
+        Google's media list contains entries with different URL suffixes:
+          ``=m140-dv``  (priority 4, download variant — fast CDN)
+          ``=m140``     (priority 1, streaming transcode — slow CDN)
+        Prefer the ``-dv`` variant for downloads.
+
+        See: https://github.com/jacob-bd/notebooklm-mcp-cli/issues/158
+        """
+        if len(artifact_data) <= 6:
+            return None
+
+        audio_options = artifact_data[6]
+        if not isinstance(audio_options, list):
+            return None
+
+        if len(audio_options) > 5 and isinstance(audio_options[5], list):
+            media_list = audio_options[5]
+
+            # First pass: prefer the -dv download variant (fast CDN).
+            for item in media_list:
+                if (
+                    isinstance(item, list)
+                    and len(item) > 2
+                    and isinstance(item[0], str)
+                    and item[0].startswith("http")
+                    and item[2] == "audio/mp4"
+                    and item[0].endswith("-dv")
+                ):
+                    return item[0]
+
+            # Second pass: any audio/mp4 URL.
+            for item in media_list:
+                if (
+                    isinstance(item, list)
+                    and len(item) > 2
+                    and isinstance(item[0], str)
+                    and item[0].startswith("http")
+                    and item[2] == "audio/mp4"
+                ):
+                    return item[0]
+
+            # Third pass: first valid media URL regardless of type.
+            for item in media_list:
+                if (
+                    isinstance(item, list)
+                    and len(item) > 0
+                    and isinstance(item[0], str)
+                    and item[0].startswith("http")
+                ):
+                    return item[0]
+
+        # Older payloads may still expose a direct URL at position 3.
+        if len(audio_options) > 3 and isinstance(audio_options[3], str):
+            return audio_options[3]
+
+        return None
+
+    def _normalize_studio_status(self, artifact_data: Any) -> str:
+        """Map raw artifact status codes to stable CLI status labels.
+
+        Audio artifacts have been observed returning status code ``2`` after
+        generation, while simultaneously exposing media URLs in their payload.
+        Treat only that verified combination as completed; keep other unknown
+        codes unchanged.
+        """
+        if not isinstance(artifact_data, list) or len(artifact_data) <= 4:
+            return "unknown"
+
+        status_code = artifact_data[4] if len(artifact_data) > 4 else None
+        if status_code == 1:
+            return "in_progress"
+        if status_code == 3:
+            return "completed"
+        if status_code == 4:
+            return "failed"
+
+        type_code = artifact_data[2] if len(artifact_data) > 2 else None
+        if (
+            status_code == 2
+            and type_code == self.STUDIO_TYPE_AUDIO
+            and self._audio_has_media_urls(artifact_data)
+        ):
+            return "completed"
+
+        return "unknown"
 
     # =========================================================================
     # Studio Operations
@@ -57,10 +172,8 @@ class StudioMixin(BaseClient):
         length_code: int = 2,  # AUDIO_LENGTH_DEFAULT
         language: str = "en",
         focus_prompt: str = "",
-    ) -> dict | None:
+    ) -> dict[str, Any] | None:
         """Create an Audio Overview (podcast) for a notebook."""
-        client = self._get_client()
-
         # Default to all sources if not specified
         if source_ids is None:
             source_ids = self._get_all_source_ids(notebook_id)
@@ -87,14 +200,7 @@ class StudioMixin(BaseClient):
             [None, None, self.STUDIO_TYPE_AUDIO, sources_nested, None, None, audio_options],
         ]
 
-        body = self._build_request_body(self.RPC_CREATE_STUDIO, params)
-        url = self._build_url(self.RPC_CREATE_STUDIO, f"/notebook/{notebook_id}")
-
-        response = client.post(url, content=body)
-        response.raise_for_status()
-
-        parsed = self._parse_response(response.text)
-        result = self._extract_rpc_result(parsed, self.RPC_CREATE_STUDIO)
+        result = self._call_rpc(self.RPC_CREATE_STUDIO, params, f"/notebook/{notebook_id}")
 
         if result and isinstance(result, list) and len(result) > 0:
             artifact_data = result[0]
@@ -103,21 +209,12 @@ class StudioMixin(BaseClient):
                 if isinstance(artifact_data, list) and len(artifact_data) > 0
                 else None
             )
-            status_code = (
-                artifact_data[4]
-                if isinstance(artifact_data, list) and len(artifact_data) > 4
-                else None
-            )
 
             return {
                 "artifact_id": artifact_id,
                 "notebook_id": notebook_id,
                 "type": "audio",
-                "status": "in_progress"
-                if status_code == 1
-                else "completed"
-                if status_code == 3
-                else "unknown",
+                "status": self._normalize_studio_status(artifact_data),
                 "format": constants.AUDIO_FORMATS.get_name(format_code),
                 "length": constants.AUDIO_LENGTHS.get_name(length_code),
                 "language": language,
@@ -130,13 +227,12 @@ class StudioMixin(BaseClient):
         notebook_id: str,
         source_ids: list[str] | None = None,
         format_code: int = 1,  # VIDEO_FORMAT_EXPLAINER
-        visual_style_code: int = 1,  # VIDEO_STYLE_AUTO_SELECT
+        visual_style_code: int | None = 1,  # VIDEO_STYLE_AUTO_SELECT
+        visual_style_prompt: str = "",
         language: str = "en",
         focus_prompt: str = "",
-    ) -> dict | None:
+    ) -> dict[str, Any] | None:
         """Create a Video Overview for a notebook."""
-        client = self._get_client()
-
         # Default to all sources if not specified
         if source_ids is None:
             source_ids = self._get_all_source_ids(notebook_id)
@@ -162,6 +258,8 @@ class StudioMixin(BaseClient):
         ]
         if format_code != constants.VIDEO_FORMAT_CINEMATIC:
             inner_options.append(visual_style_code)
+            if visual_style_prompt:
+                inner_options.append(visual_style_prompt)
 
         video_options = [None, None, inner_options]
 
@@ -181,14 +279,7 @@ class StudioMixin(BaseClient):
             ],
         ]
 
-        body = self._build_request_body(self.RPC_CREATE_STUDIO, params)
-        url = self._build_url(self.RPC_CREATE_STUDIO, f"/notebook/{notebook_id}")
-
-        response = client.post(url, content=body)
-        response.raise_for_status()
-
-        parsed = self._parse_response(response.text)
-        result = self._extract_rpc_result(parsed, self.RPC_CREATE_STUDIO)
+        result = self._call_rpc(self.RPC_CREATE_STUDIO, params, f"/notebook/{notebook_id}")
 
         if result and isinstance(result, list) and len(result) > 0:
             artifact_data = result[0]
@@ -197,44 +288,27 @@ class StudioMixin(BaseClient):
                 if isinstance(artifact_data, list) and len(artifact_data) > 0
                 else None
             )
-            status_code = (
-                artifact_data[4]
-                if isinstance(artifact_data, list) and len(artifact_data) > 4
-                else None
-            )
 
             return {
                 "artifact_id": artifact_id,
                 "notebook_id": notebook_id,
                 "type": "video",
-                "status": "in_progress"
-                if status_code == 1
-                else "completed"
-                if status_code == 3
-                else "unknown",
+                "status": self._normalize_studio_status(artifact_data),
                 "format": constants.VIDEO_FORMATS.get_name(format_code),
                 "visual_style": constants.VIDEO_STYLES.get_name(visual_style_code)
-                if format_code != constants.VIDEO_FORMAT_CINEMATIC
+                if format_code != constants.VIDEO_FORMAT_CINEMATIC and visual_style_code is not None
                 else None,
+                "visual_style_prompt": visual_style_prompt or None,
                 "language": language,
             }
 
         return None
 
-    def poll_studio_status(self, notebook_id: str) -> list[dict]:
+    def poll_studio_status(self, notebook_id: str) -> list[dict[str, Any]]:
         """Poll for studio content (audio/video overviews) status."""
-        client = self._get_client()
-
         # Poll params: [[2], notebook_id, 'NOT artifact.status = "ARTIFACT_STATUS_SUGGESTED"']
         params = [[2], notebook_id, 'NOT artifact.status = "ARTIFACT_STATUS_SUGGESTED"']
-        body = self._build_request_body(self.RPC_POLL_STUDIO, params)
-        url = self._build_url(self.RPC_POLL_STUDIO, f"/notebook/{notebook_id}")
-
-        response = client.post(url, content=body)
-        response.raise_for_status()
-
-        parsed = self._parse_response(response.text)
-        result = self._extract_rpc_result(parsed, self.RPC_POLL_STUDIO)
+        result = self._call_rpc(self.RPC_POLL_STUDIO, params, path=f"/notebook/{notebook_id}")
 
         artifacts = []
         if result and isinstance(result, list) and len(result) > 0:
@@ -248,8 +322,6 @@ class StudioMixin(BaseClient):
                 artifact_id = artifact_data[0]
                 title = artifact_data[1] if len(artifact_data) > 1 else ""
                 type_code = artifact_data[2] if len(artifact_data) > 2 else None
-                status_code = artifact_data[4] if len(artifact_data) > 4 else None
-
                 audio_url = None
                 video_url = None
                 duration_seconds = None
@@ -258,7 +330,7 @@ class StudioMixin(BaseClient):
                 if type_code == self.STUDIO_TYPE_AUDIO and len(artifact_data) > 6:
                     audio_options = artifact_data[6]
                     if isinstance(audio_options, list) and len(audio_options) > 3:
-                        audio_url = audio_options[3] if isinstance(audio_options[3], str) else None
+                        audio_url = self._extract_audio_media_url(artifact_data)
                         # Duration is often at position 9
                         if len(audio_options) > 9 and isinstance(audio_options[9], list):
                             duration_seconds = audio_options[9][0] if audio_options[9] else None
@@ -364,21 +436,17 @@ class StudioMixin(BaseClient):
                     self.STUDIO_TYPE_SLIDE_DECK: "slide_deck",
                     self.STUDIO_TYPE_DATA_TABLE: "data_table",
                 }
-                artifact_type = "quiz" if is_quiz else type_map.get(type_code, "unknown")
-                status_map = {
-                    1: "in_progress",
-                    3: "completed",
-                    4: "failed",
-                }
-                status = status_map.get(status_code, "unknown")
+                artifact_type = "quiz" if is_quiz else type_map.get(cast(int, type_code), "unknown")
+                status = self._normalize_studio_status(artifact_data)
 
                 # Extract custom_instructions (focus prompt) if present
                 # Different artifact types store prompts at different indices:
                 # - Audio: artifact_data[6][1][0]
-                # - Video: artifact_data[8][2][2]
+                # - Video: artifact_data[8][2][2] (focus), artifact_data[8][2][6] (style prompt)
                 # - Slides: artifact_data[16][0][0]
                 # - Quiz/Flashcards: artifact_data[9][1][1]
                 custom_instructions = None
+                visual_style_prompt = None
 
                 if type_code == self.STUDIO_TYPE_AUDIO and len(artifact_data) > 6:
                     options_data = artifact_data[6]
@@ -392,9 +460,11 @@ class StudioMixin(BaseClient):
                     options_data = artifact_data[8]
                     if isinstance(options_data, list) and len(options_data) > 2:
                         inner = options_data[2]
-                        if isinstance(inner, list) and len(inner) > 2:  # noqa: SIM102
-                            if isinstance(inner[2], str) and inner[2]:
+                        if isinstance(inner, list):
+                            if len(inner) > 2 and isinstance(inner[2], str) and inner[2]:
                                 custom_instructions = inner[2]
+                            if len(inner) > 6 and isinstance(inner[6], str) and inner[6]:
+                                visual_style_prompt = inner[6]
 
                 elif type_code == self.STUDIO_TYPE_SLIDE_DECK and len(artifact_data) > 16:
                     options_data = artifact_data[16]
@@ -422,6 +492,7 @@ class StudioMixin(BaseClient):
                         "status": status,
                         "created_at": created_at,
                         "custom_instructions": custom_instructions,
+                        "visual_style_prompt": visual_style_prompt,
                         "audio_url": audio_url,
                         "video_url": video_url,
                         "infographic_url": infographic_url,
@@ -434,7 +505,7 @@ class StudioMixin(BaseClient):
 
         return artifacts
 
-    def get_studio_status(self, notebook_id: str) -> list[dict]:
+    def get_studio_status(self, notebook_id: str) -> list[dict[str, Any]]:
         """Alias for poll_studio_status (used by CLI)."""
         return self.poll_studio_status(notebook_id)
 
@@ -527,7 +598,7 @@ class StudioMixin(BaseClient):
         self,
         artifact_id: str,
         slide_instructions: list[tuple[int, str]],
-    ) -> dict | None:
+    ) -> dict[str, Any] | None:
         """Revise an existing slide deck with per-slide instructions.
 
         Creates a NEW slide deck artifact with the requested changes applied.
@@ -554,18 +625,15 @@ class StudioMixin(BaseClient):
             artifact_data = result[0]
             if isinstance(artifact_data, list) and len(artifact_data) > 0:
                 new_artifact_id = artifact_data[0]
-                title = artifact_data[2] if len(artifact_data) > 2 else None
-                status_code = artifact_data[4] if len(artifact_data) > 4 else None
+                # Studio artifact payloads use index 1 for the title and index 2
+                # for the artifact type code. Reuse the same layout as status polling.
+                title = artifact_data[1] if len(artifact_data) > 1 else None
 
                 return {
                     "artifact_id": new_artifact_id,
                     "title": title,
                     "original_artifact_id": artifact_id,
-                    "status": "in_progress"
-                    if status_code == 1
-                    else "completed"
-                    if status_code == 3
-                    else "unknown",
+                    "status": self._normalize_studio_status(artifact_data),
                 }
 
         return None
@@ -579,10 +647,8 @@ class StudioMixin(BaseClient):
         visual_style_code: int = 1,  # INFOGRAPHIC_STYLE_AUTO_SELECT
         language: str = "en",
         focus_prompt: str = "",
-    ) -> dict | None:
+    ) -> dict[str, Any] | None:
         """Create an Infographic from notebook sources."""
-        client = self._get_client()
-
         # Default to all sources if not specified
         if source_ids is None:
             source_ids = self._get_all_source_ids(notebook_id)
@@ -628,14 +694,7 @@ class StudioMixin(BaseClient):
 
         params = [[2], notebook_id, content]
 
-        body = self._build_request_body(self.RPC_CREATE_STUDIO, params)
-        url = self._build_url(self.RPC_CREATE_STUDIO, f"/notebook/{notebook_id}")
-
-        response = client.post(url, content=body)
-        response.raise_for_status()
-
-        parsed = self._parse_response(response.text)
-        result = self._extract_rpc_result(parsed, self.RPC_CREATE_STUDIO)
+        result = self._call_rpc(self.RPC_CREATE_STUDIO, params, f"/notebook/{notebook_id}")
 
         if result and isinstance(result, list) and len(result) > 0:
             artifact_data = result[0]
@@ -644,21 +703,12 @@ class StudioMixin(BaseClient):
                 if isinstance(artifact_data, list) and len(artifact_data) > 0
                 else None
             )
-            status_code = (
-                artifact_data[4]
-                if isinstance(artifact_data, list) and len(artifact_data) > 4
-                else None
-            )
 
             return {
                 "artifact_id": artifact_id,
                 "notebook_id": notebook_id,
                 "type": "infographic",
-                "status": "in_progress"
-                if status_code == 1
-                else "completed"
-                if status_code == 3
-                else "unknown",
+                "status": self._normalize_studio_status(artifact_data),
                 "orientation": constants.INFOGRAPHIC_ORIENTATIONS.get_name(orientation_code),
                 "detail_level": constants.INFOGRAPHIC_DETAILS.get_name(detail_level_code),
                 "visual_style": constants.INFOGRAPHIC_STYLES.get_name(visual_style_code),
@@ -675,10 +725,8 @@ class StudioMixin(BaseClient):
         length_code: int = 3,  # SLIDE_DECK_LENGTH_DEFAULT
         language: str = "en",
         focus_prompt: str = "",
-    ) -> dict | None:
+    ) -> dict[str, Any] | None:
         """Create a Slide Deck from notebook sources."""
-        client = self._get_client()
-
         # Default to all sources if not specified
         if source_ids is None:
             source_ids = self._get_all_source_ids(notebook_id)
@@ -716,14 +764,7 @@ class StudioMixin(BaseClient):
 
         params = [[2], notebook_id, content]
 
-        body = self._build_request_body(self.RPC_CREATE_STUDIO, params)
-        url = self._build_url(self.RPC_CREATE_STUDIO, f"/notebook/{notebook_id}")
-
-        response = client.post(url, content=body)
-        response.raise_for_status()
-
-        parsed = self._parse_response(response.text)
-        result = self._extract_rpc_result(parsed, self.RPC_CREATE_STUDIO)
+        result = self._call_rpc(self.RPC_CREATE_STUDIO, params, f"/notebook/{notebook_id}")
 
         if result and isinstance(result, list) and len(result) > 0:
             artifact_data = result[0]
@@ -732,21 +773,12 @@ class StudioMixin(BaseClient):
                 if isinstance(artifact_data, list) and len(artifact_data) > 0
                 else None
             )
-            status_code = (
-                artifact_data[4]
-                if isinstance(artifact_data, list) and len(artifact_data) > 4
-                else None
-            )
 
             return {
                 "artifact_id": artifact_id,
                 "notebook_id": notebook_id,
                 "type": "slide_deck",
-                "status": "in_progress"
-                if status_code == 1
-                else "completed"
-                if status_code == 3
-                else "unknown",
+                "status": self._normalize_studio_status(artifact_data),
                 "format": constants.SLIDE_DECK_FORMATS.get_name(format_code),
                 "length": constants.SLIDE_DECK_LENGTHS.get_name(length_code),
                 "language": language,
@@ -761,10 +793,8 @@ class StudioMixin(BaseClient):
         report_format: str = "Briefing Doc",
         custom_prompt: str = "",
         language: str = "en",
-    ) -> dict | None:
+    ) -> dict[str, Any] | None:
         """Create a Report from notebook sources."""
-        client = self._get_client()
-
         # Default to all sources if not specified
         if source_ids is None:
             source_ids = self._get_all_source_ids(notebook_id)
@@ -853,14 +883,7 @@ class StudioMixin(BaseClient):
 
         params = [[2], notebook_id, content]
 
-        body = self._build_request_body(self.RPC_CREATE_STUDIO, params)
-        url = self._build_url(self.RPC_CREATE_STUDIO, f"/notebook/{notebook_id}")
-
-        response = client.post(url, content=body)
-        response.raise_for_status()
-
-        parsed = self._parse_response(response.text)
-        result = self._extract_rpc_result(parsed, self.RPC_CREATE_STUDIO)
+        result = self._call_rpc(self.RPC_CREATE_STUDIO, params, f"/notebook/{notebook_id}")
 
         if result and isinstance(result, list) and len(result) > 0:
             artifact_data = result[0]
@@ -869,21 +892,12 @@ class StudioMixin(BaseClient):
                 if isinstance(artifact_data, list) and len(artifact_data) > 0
                 else None
             )
-            status_code = (
-                artifact_data[4]
-                if isinstance(artifact_data, list) and len(artifact_data) > 4
-                else None
-            )
 
             return {
                 "artifact_id": artifact_id,
                 "notebook_id": notebook_id,
                 "type": "report",
-                "status": "in_progress"
-                if status_code == 1
-                else "completed"
-                if status_code == 3
-                else "unknown",
+                "status": self._normalize_studio_status(artifact_data),
                 "format": report_format,
                 "language": language,
             }
@@ -896,10 +910,8 @@ class StudioMixin(BaseClient):
         source_ids: list[str] | None = None,
         difficulty_code: int = 2,  # FLASHCARD_DIFFICULTY_MEDIUM
         focus_prompt: str = "",
-    ) -> dict | None:
+    ) -> dict[str, Any] | None:
         """Create Flashcards from notebook sources."""
-        client = self._get_client()
-
         # Default to all sources if not specified
         if source_ids is None:
             source_ids = self._get_all_source_ids(notebook_id)
@@ -944,14 +956,7 @@ class StudioMixin(BaseClient):
 
         params = [[2], notebook_id, content]
 
-        body = self._build_request_body(self.RPC_CREATE_STUDIO, params)
-        url = self._build_url(self.RPC_CREATE_STUDIO, f"/notebook/{notebook_id}")
-
-        response = client.post(url, content=body)
-        response.raise_for_status()
-
-        parsed = self._parse_response(response.text)
-        result = self._extract_rpc_result(parsed, self.RPC_CREATE_STUDIO)
+        result = self._call_rpc(self.RPC_CREATE_STUDIO, params, f"/notebook/{notebook_id}")
 
         if result and isinstance(result, list) and len(result) > 0:
             artifact_data = result[0]
@@ -960,21 +965,12 @@ class StudioMixin(BaseClient):
                 if isinstance(artifact_data, list) and len(artifact_data) > 0
                 else None
             )
-            status_code = (
-                artifact_data[4]
-                if isinstance(artifact_data, list) and len(artifact_data) > 4
-                else None
-            )
 
             return {
                 "artifact_id": artifact_id,
                 "notebook_id": notebook_id,
                 "type": "flashcards",
-                "status": "in_progress"
-                if status_code == 1
-                else "completed"
-                if status_code == 3
-                else "unknown",
+                "status": self._normalize_studio_status(artifact_data),
                 "difficulty": constants.FLASHCARD_DIFFICULTIES.get_name(difficulty_code),
             }
 
@@ -987,7 +983,7 @@ class StudioMixin(BaseClient):
         question_count: int = 2,
         difficulty: int = 2,
         focus_prompt: str = "",
-    ) -> dict | None:
+    ) -> dict[str, Any] | None:
         """Create Quiz from notebook sources.
 
         Args:
@@ -997,8 +993,6 @@ class StudioMixin(BaseClient):
             difficulty: Difficulty level (default: 2)
             focus_prompt: Optional focus prompt to guide quiz generation
         """
-        client = self._get_client()
-
         # Default to all sources if not specified
         if source_ids is None:
             source_ids = self._get_all_source_ids(notebook_id)
@@ -1040,14 +1034,7 @@ class StudioMixin(BaseClient):
 
         params = [[2], notebook_id, content]
 
-        body = self._build_request_body(self.RPC_CREATE_STUDIO, params)
-        url = self._build_url(self.RPC_CREATE_STUDIO, f"/notebook/{notebook_id}")
-
-        response = client.post(url, content=body)
-        response.raise_for_status()
-
-        parsed = self._parse_response(response.text)
-        result = self._extract_rpc_result(parsed, self.RPC_CREATE_STUDIO)
+        result = self._call_rpc(self.RPC_CREATE_STUDIO, params, f"/notebook/{notebook_id}")
 
         if result and isinstance(result, list) and len(result) > 0:
             artifact_data = result[0]
@@ -1056,21 +1043,12 @@ class StudioMixin(BaseClient):
                 if isinstance(artifact_data, list) and len(artifact_data) > 0
                 else None
             )
-            status_code = (
-                artifact_data[4]
-                if isinstance(artifact_data, list) and len(artifact_data) > 4
-                else None
-            )
 
             return {
                 "artifact_id": artifact_id,
                 "notebook_id": notebook_id,
                 "type": "quiz",
-                "status": "in_progress"
-                if status_code == 1
-                else "completed"
-                if status_code == 3
-                else "unknown",
+                "status": self._normalize_studio_status(artifact_data),
                 "question_count": question_count,
                 "difficulty": constants.FLASHCARD_DIFFICULTIES.get_name(difficulty),
             }
@@ -1083,7 +1061,7 @@ class StudioMixin(BaseClient):
         source_ids: list[str] | None = None,
         description: str = "",
         language: str = "en",
-    ) -> dict | None:
+    ) -> dict[str, Any] | None:
         """Create Data Table from notebook sources.
 
         Args:
@@ -1092,8 +1070,6 @@ class StudioMixin(BaseClient):
             description: Description of the data table to create
             language: Language code (default: "en")
         """
-        client = self._get_client()
-
         # Default to all sources if not specified
         if source_ids is None:
             source_ids = self._get_all_source_ids(notebook_id)
@@ -1132,14 +1108,7 @@ class StudioMixin(BaseClient):
 
         params = [[2], notebook_id, content]
 
-        body = self._build_request_body(self.RPC_CREATE_STUDIO, params)
-        url = self._build_url(self.RPC_CREATE_STUDIO, f"/notebook/{notebook_id}")
-
-        response = client.post(url, content=body)
-        response.raise_for_status()
-
-        parsed = self._parse_response(response.text)
-        result = self._extract_rpc_result(parsed, self.RPC_CREATE_STUDIO)
+        result = self._call_rpc(self.RPC_CREATE_STUDIO, params, f"/notebook/{notebook_id}")
 
         if result and isinstance(result, list) and len(result) > 0:
             artifact_data = result[0]
@@ -1148,21 +1117,12 @@ class StudioMixin(BaseClient):
                 if isinstance(artifact_data, list) and len(artifact_data) > 0
                 else None
             )
-            status_code = (
-                artifact_data[4]
-                if isinstance(artifact_data, list) and len(artifact_data) > 4
-                else None
-            )
 
             return {
                 "artifact_id": artifact_id,
                 "notebook_id": notebook_id,
                 "type": "data_table",
-                "status": "in_progress"
-                if status_code == 1
-                else "completed"
-                if status_code == 3
-                else "unknown",
+                "status": self._normalize_studio_status(artifact_data),
                 "description": description,
             }
 
@@ -1172,7 +1132,7 @@ class StudioMixin(BaseClient):
         self,
         notebook_id: str,
         source_ids: list[str] | None = None,
-    ) -> dict | None:
+    ) -> dict[str, Any] | None:
         """Generate a Mind Map JSON from sources.
 
         This is step 1 of 2 for creating a mind map. After generation,
@@ -1197,8 +1157,6 @@ class StudioMixin(BaseClient):
         Raises:
             ValueError: If no sources found in notebook
         """
-        client = self._get_client()
-
         # Default to all sources if not specified
         if source_ids is None:
             source_ids = self._get_all_source_ids(notebook_id)
@@ -1222,14 +1180,7 @@ class StudioMixin(BaseClient):
             [2, None, [1]],
         ]
 
-        body = self._build_request_body(self.RPC_GENERATE_MIND_MAP, params)
-        url = self._build_url(self.RPC_GENERATE_MIND_MAP)
-
-        response = client.post(url, content=body)
-        response.raise_for_status()
-
-        parsed = self._parse_response(response.text)
-        result = self._extract_rpc_result(parsed, self.RPC_GENERATE_MIND_MAP)
+        result = self._call_rpc(self.RPC_GENERATE_MIND_MAP, params)
 
         if result and isinstance(result, list) and len(result) > 0:
             # Response is nested: [[json_string, null, [gen_ids]]]
@@ -1257,7 +1208,7 @@ class StudioMixin(BaseClient):
         mind_map_json: str,
         source_ids: list[str] | None = None,
         title: str = "Mind Map",
-    ) -> dict | None:
+    ) -> dict[str, Any] | None:
         """Save a generated Mind Map to a notebook.
 
         This is step 2 of 2 for creating a mind map. First use
@@ -1272,8 +1223,6 @@ class StudioMixin(BaseClient):
         Returns:
             Dict with mind_map_id and saved info, or None on failure
         """
-        client = self._get_client()
-
         # Default to all sources if not specified
         if source_ids is None:
             source_ids = self._get_all_source_ids(notebook_id)
@@ -1290,14 +1239,7 @@ class StudioMixin(BaseClient):
 
         params = [notebook_id, mind_map_json, metadata, None, title]
 
-        body = self._build_request_body(self.RPC_SAVE_MIND_MAP, params)
-        url = self._build_url(self.RPC_SAVE_MIND_MAP, f"/notebook/{notebook_id}")
-
-        response = client.post(url, content=body)
-        response.raise_for_status()
-
-        parsed = self._parse_response(response.text)
-        result = self._extract_rpc_result(parsed, self.RPC_SAVE_MIND_MAP)
+        result = self._call_rpc(self.RPC_SAVE_MIND_MAP, params, f"/notebook/{notebook_id}")
 
         if result and isinstance(result, list) and len(result) > 0:
             # Response is nested: [[mind_map_id, json, metadata, null, title]]
@@ -1316,20 +1258,11 @@ class StudioMixin(BaseClient):
 
         return None
 
-    def list_mind_maps(self, notebook_id: str) -> list[dict]:
+    def list_mind_maps(self, notebook_id: str) -> list[dict[str, Any]]:
         """List all Mind Maps in a notebook."""
-        client = self._get_client()
-
         params = [notebook_id]
 
-        body = self._build_request_body(self.RPC_LIST_MIND_MAPS, params)
-        url = self._build_url(self.RPC_LIST_MIND_MAPS, f"/notebook/{notebook_id}")
-
-        response = client.post(url, content=body)
-        response.raise_for_status()
-
-        parsed = self._parse_response(response.text)
-        result = self._extract_rpc_result(parsed, self.RPC_LIST_MIND_MAPS)
+        result = self._call_rpc(self.RPC_LIST_MIND_MAPS, params, f"/notebook/{notebook_id}")
 
         mind_maps = []
         if result and isinstance(result, list) and len(result) > 0:

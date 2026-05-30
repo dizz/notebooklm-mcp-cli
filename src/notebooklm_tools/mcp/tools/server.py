@@ -2,7 +2,7 @@
 
 import json
 import urllib.request
-from typing import Any
+from typing import Any, cast
 
 from notebooklm_tools import __version__
 
@@ -19,10 +19,15 @@ def _get_latest_pypi_version() -> str | None:
         url = "https://pypi.org/pypi/notebooklm-mcp-cli/json"
         req = urllib.request.Request(url, headers={"User-Agent": "notebooklm-mcp-cli"})
         with urllib.request.urlopen(req, timeout=2) as response:
-            data = json.loads(response.read().decode())
-            return data.get("info", {}).get("version")
+            data = cast(dict[str, Any], json.loads(response.read().decode()))
+            info = data.get("info")
+            if isinstance(info, dict):
+                version = info.get("version")
+                if isinstance(version, str):
+                    return version
     except Exception:
         return None
+    return None
 
 
 def _compare_versions(current: str, latest: str) -> bool:
@@ -40,18 +45,45 @@ def _compare_versions(current: str, latest: str) -> bool:
         return False
 
 
+def _check_auth_status() -> str:
+    """Return the classic string status used by server_info.
+
+    This is now a trivial, elegant wrapper around the single source of truth
+    (`check_auth` in core/auth.py). All the real logic + tests live there.
+    """
+    try:
+        from notebooklm_tools.core.auth import check_auth
+
+        res = check_auth(live=True)
+
+        if res.valid:
+            return "configured"
+        if res.reason == "no_tokens":
+            return "not_configured"
+        # expired, network_error, stale_heuristic, http_*, etc. → treat as unusable
+        return "stale"
+    except Exception:
+        return "error"
+
+
 @logged_tool()
 def server_info() -> dict[str, Any]:
-    """Get server version and check for updates.
+    """Get server version, check for updates, and report auth status.
 
     AI assistants: If update_available is True, inform the user that a new
     version is available and suggest updating with the provided command.
+
+    auth_status now performs a best-effort *live* validation against
+    NotebookLM (same mechanism as `nlm login --check`) when tokens exist.
+    This makes the reported status consistent with actual usability instead
+    of relying only on a local age heuristic.
 
     Returns:
         dict with version info:
         - version: Current installed version
         - latest_version: Latest version on PyPI (or None if check failed)
         - update_available: True if a newer version exists
+        - auth_status: configured | stale | not_configured | error
         - update_command: Command to run to update
     """
     latest = _get_latest_pypi_version()
@@ -65,6 +97,7 @@ def server_info() -> dict[str, Any]:
         "version": __version__,
         "latest_version": latest,
         "update_available": update_available,
+        "auth_status": _check_auth_status(),
         "update_command": "uv tool upgrade notebooklm-mcp-cli",
         "pip_update_command": "pip install --upgrade notebooklm-mcp-cli",
     }

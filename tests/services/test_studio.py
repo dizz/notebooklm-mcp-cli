@@ -5,14 +5,17 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from notebooklm_tools.core.errors import ResourceExhaustedError, RPCError
 from notebooklm_tools.services.errors import ServiceError, ValidationError
 from notebooklm_tools.services.studio import (
     VALID_ARTIFACT_TYPES,
+    _normalize_video_style,
     create_artifact,
     delete_artifact,
     get_studio_status,
     rename_artifact,
     resolve_code,
+    revise_artifact,
     validate_artifact_type,
 )
 
@@ -108,10 +111,140 @@ class TestCreateArtifact:
         call_kwargs = mock_client.create_video_overview.call_args
         assert call_kwargs[1]["format_code"] == 3
 
+    def test_create_video_custom_style_prompt_implies_custom_style(self, mock_client):
+        result = create_artifact(
+            mock_client,
+            "nb-1",
+            "video",
+            video_style_prompt="children's storybook illustration",
+        )
+        assert result["artifact_type"] == "video"
+        call_kwargs = mock_client.create_video_overview.call_args
+        assert call_kwargs[1]["visual_style_code"] is None
+        assert call_kwargs[1]["visual_style_prompt"] == "children's storybook illustration"
+
+    def test_create_video_style_and_focus_are_sent_separately(self, mock_client):
+        create_artifact(
+            mock_client,
+            "nb-1",
+            "video",
+            video_style_prompt="storybook",
+            focus_prompt="explain slowly",
+        )
+        call_kwargs = mock_client.create_video_overview.call_args
+        assert call_kwargs[1]["focus_prompt"] == "explain slowly"
+        assert call_kwargs[1]["visual_style_prompt"] == "storybook"
+
     def test_create_video_invalid_format(self, mock_client):
         """Invalid video format raises ValidationError."""
         with pytest.raises(ValidationError, match="Unknown video format"):
             create_artifact(mock_client, "nb-1", "video", video_format="invalid_format")
+
+    def test_create_video_custom_style_requires_prompt(self, mock_client):
+        with pytest.raises(ValidationError, match="requires --style-prompt"):
+            create_artifact(mock_client, "nb-1", "video", visual_style="custom")
+
+    def test_create_video_style_prompt_rejects_fixed_style(self, mock_client):
+        with pytest.raises(ValidationError, match="only be used with --style custom"):
+            create_artifact(
+                mock_client,
+                "nb-1",
+                "video",
+                visual_style="classic",
+                video_style_prompt="storybook",
+            )
+
+    def test_create_video_cinematic_maps_style_prompt_to_focus(self, mock_client):
+        """Cinematic --style-prompt is remapped to focus_prompt (custom_instructions)."""
+        result = create_artifact(
+            mock_client,
+            "nb-1",
+            "video",
+            video_format="cinematic",
+            video_style_prompt="storybook illustration",
+        )
+        assert result["artifact_type"] == "video"
+        call_kwargs = mock_client.create_video_overview.call_args
+        assert call_kwargs[1]["focus_prompt"] == "storybook illustration"
+        assert call_kwargs[1]["visual_style_prompt"] == ""
+
+    def test_create_video_cinematic_merges_style_prompt_and_focus(self, mock_client):
+        """Cinematic with both --style-prompt and --focus merges them."""
+        create_artifact(
+            mock_client,
+            "nb-1",
+            "video",
+            video_format="cinematic",
+            video_style_prompt="storybook illustration",
+            focus_prompt="explain quantum physics",
+        )
+        call_kwargs = mock_client.create_video_overview.call_args
+        assert "explain quantum physics" in call_kwargs[1]["focus_prompt"]
+        assert "storybook illustration" in call_kwargs[1]["focus_prompt"]
+        assert call_kwargs[1]["visual_style_prompt"] == ""
+
+    def test_create_video_cinematic_rejects_style(self, mock_client):
+        """Cinematic still rejects --style (style codes don't apply)."""
+        with pytest.raises(ValidationError, match="does not support --style") as exc_info:
+            create_artifact(
+                mock_client,
+                "nb-1",
+                "video",
+                video_format="cinematic",
+                visual_style="classic",
+            )
+        assert "--focus" in str(exc_info.value)
+
+    def test_resource_exhausted_gives_retry_hint(self, mock_client):
+        """ResourceExhaustedError wraps with user-friendly retry message."""
+        mock_client.create_infographic.side_effect = ResourceExhaustedError(
+            "API error (code 8): Too many requests",
+            detail_type="type.googleapis.com/UserDisplayableError",
+            detail_data=["Too many requests"],
+        )
+        with pytest.raises(ServiceError) as exc_info:
+            create_artifact(mock_client, "nb-1", "infographic")
+
+        err = exc_info.value
+        assert "Rate limited" in err.user_message
+        assert "Wait" in err.user_message
+        assert err.hint is not None
+        assert "1-2 minutes" in err.hint
+
+    def test_rpc_error_wraps_with_detail(self, mock_client):
+        """Generic RPCError in create_artifact includes short detail name."""
+        mock_client.create_infographic.side_effect = RPCError(
+            "API error (code 7): PERMISSION_DENIED",
+            error_code=7,
+            detail_type="type.googleapis.com/SomeErrorDetail",
+        )
+        with pytest.raises(ServiceError) as exc_info:
+            create_artifact(mock_client, "nb-1", "infographic")
+
+        err = exc_info.value
+        assert "SomeErrorDetail" in err.user_message
+        assert "code 7" in err.user_message
+
+
+class TestNormalizeVideoStyle:
+    """Test video style normalization rules."""
+
+    def test_auto_select_with_style_prompt_becomes_custom(self):
+        style, prompt = _normalize_video_style(
+            video_format="explainer",
+            visual_style="auto_select",
+            video_style_prompt="storybook",
+        )
+        assert style == "custom"
+        assert prompt == "storybook"
+
+    def test_custom_without_prompt_raises(self):
+        with pytest.raises(ValidationError, match="requires --style-prompt"):
+            _normalize_video_style(
+                video_format="explainer",
+                visual_style="custom",
+                video_style_prompt="",
+            )
 
     def test_create_infographic(self, mock_client):
         result = create_artifact(mock_client, "nb-1", "infographic")
@@ -216,6 +349,70 @@ class TestGetStudioStatus:
         mock_client.poll_studio_status.side_effect = RuntimeError("fail")
         with pytest.raises(ServiceError, match="Failed to poll"):
             get_studio_status(mock_client, "nb-1")
+
+
+class TestReviseArtifact:
+    """Test revise_artifact function."""
+
+    def test_rpc_error_uses_short_detail_name_and_hint(self, mock_client):
+        mock_client.revise_slide_deck.side_effect = RPCError(
+            "API error (code 7): PERMISSION_DENIED",
+            error_code=7,
+            detail_type="type.googleapis.com/notebooklm.ReviseSlideDeckErrorDetail",
+            detail_data=[1],
+        )
+
+        with pytest.raises(ServiceError) as exc_info:
+            revise_artifact(
+                mock_client,
+                "art-123",
+                [{"slide": 1, "instruction": "Tighten the title"}],
+            )
+
+        err = exc_info.value
+        assert "Google API error code 7" in err.user_message
+        assert "code 7" in err.user_message
+        assert "ReviseSlideDeckErrorDetail" in err.user_message
+        assert "type.googleapis.com" not in err.user_message
+        assert err.hint is not None
+        assert "editable notebook you own" in err.hint
+        assert "view-only/shared decks" in err.hint
+
+    def test_rpc_error_without_detail_type_preserves_original_message(self, mock_client):
+        mock_client.revise_slide_deck.side_effect = RPCError(
+            "API error (code 7): PERMISSION_DENIED",
+            error_code=7,
+        )
+
+        with pytest.raises(ServiceError) as exc_info:
+            revise_artifact(
+                mock_client,
+                "art-123",
+                [{"slide": 1, "instruction": "Tighten the title"}],
+            )
+
+        err = exc_info.value
+        assert "PERMISSION_DENIED" in err.user_message
+        assert err.hint is not None
+        assert "editable notebook you own" in err.hint
+
+    def test_rpc_error_code_8_gives_throttle_hint(self, mock_client):
+        """Code 8 on revise gives throttle-specific hint."""
+        mock_client.revise_slide_deck.side_effect = ResourceExhaustedError(
+            "API error (code 8): Rate limited",
+            detail_type="type.googleapis.com/UserDisplayableError",
+        )
+
+        with pytest.raises(ServiceError) as exc_info:
+            revise_artifact(
+                mock_client,
+                "art-123",
+                [{"slide": 1, "instruction": "Tighten the title"}],
+            )
+
+        err = exc_info.value
+        assert err.hint is not None
+        assert "1-2 minutes" in err.hint
 
 
 class TestRenameArtifact:

@@ -12,7 +12,7 @@
 
 **Programmatic access to Google NotebookLM** — via command-line interface (CLI) or Model Context Protocol (MCP) server.
 
-> **Note:** Tested with Pro/free tier accounts. May work with NotebookLM Enterprise accounts but has not been tested.
+> **Note:** Tested with Pro/free and Google AI Ultra ($249/mo) tier accounts. May work with NotebookLM Enterprise accounts but has not been tested.
 
 📺 **Watch the Demos**
 
@@ -60,6 +60,7 @@ Connect AI assistants (Claude, Gemini, Cursor, etc.) to NotebookLM:
 # Automatic setup — picks the right config for each tool
 nlm setup add claude-code
 nlm setup add gemini
+nlm setup add github-copilot
 nlm setup add cursor
 nlm setup add cline
 nlm setup add antigravity
@@ -300,7 +301,7 @@ nlm login --manual     # Manual file mode
 
 **How it works:** Auto mode launches a dedicated browser profile (supports Chrome, Arc, Brave, Edge, Chromium, and more), you log in to Google, and cookies are extracted automatically. Your login persists for future auth refreshes.
 
-**Prefer a specific browser?** Set it with `nlm config set auth.browser brave` (or `arc`, `edge`, `chromium`, etc.). Falls back to auto-detection if the preferred browser is not found.
+**Prefer a specific browser?** Set it with `nlm config set auth.browser chromium` (or `brave`, `arc`, `edge`, `chrome`, etc.). Falls back to auto-detection if the preferred browser is not found.
 
 For detailed instructions and troubleshooting, see **[docs/AUTHENTICATION.md](docs/AUTHENTICATION.md)**.
 
@@ -317,6 +318,7 @@ Use `nlm setup` to automatically configure the MCP server for your AI tools — 
 nlm setup add claude-code
 nlm setup add claude-desktop
 nlm setup add gemini
+nlm setup add github-copilot
 nlm setup add cursor
 nlm setup add windsurf
 
@@ -400,7 +402,19 @@ gemini mcp add --scope user notebooklm-mcp notebooklm-mcp
 | Cursor | `~/.cursor/mcp.json` |
 | Windsurf | `~/.codeium/windsurf/mcp_config.json` |
 
-**Claude Desktop / VS Code** may not resolve `PATH` — use the full path to the binary:
+**GitHub Copilot (VS Code workspace)** uses `.vscode/mcp.json` with a top-level `servers` key:
+```json
+{
+  "servers": {
+    "notebooklm-mcp": {
+      "command": "notebooklm-mcp",
+      "args": []
+    }
+  }
+}
+```
+
+**Claude Desktop** may not resolve `PATH` — use the full path to the binary:
 ```json
 {
   "mcpServers": {
@@ -416,7 +430,7 @@ Find your path with: `which notebooklm-mcp`
 | Tool | Config Location |
 |------|-----------------|
 | Claude Desktop | `~/Library/Application Support/Claude/claude_desktop_config.json` |
-| VS Code | `~/.vscode/mcp.json` |
+| GitHub Copilot | `.vscode/mcp.json` |
 
 </details>
 

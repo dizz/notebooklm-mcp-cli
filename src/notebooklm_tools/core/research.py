@@ -5,8 +5,11 @@ This module provides the ResearchMixin class which handles all research
 operations (web search, Drive search, and source discovery).
 """
 
+import time
+
 from . import constants
 from .base import BaseClient
+from .errors import RPCError
 
 
 class ResearchMixin(BaseClient):
@@ -100,18 +103,9 @@ class ResearchMixin(BaseClient):
         Returns:
             Dict with status, sources, and summary when complete
         """
-        client = self._get_client()
-
         # Poll params: [null, null, "notebook_id"]
         params = [None, None, notebook_id]
-        body = self._build_request_body(self.RPC_POLL_RESEARCH, params)
-        url = self._build_url(self.RPC_POLL_RESEARCH, f"/notebook/{notebook_id}")
-
-        response = client.post(url, content=body)
-        response.raise_for_status()
-
-        parsed = self._parse_response(response.text)
-        result = self._extract_rpc_result(parsed, self.RPC_POLL_RESEARCH)
+        result = self._call_rpc(self.RPC_POLL_RESEARCH, params, f"/notebook/{notebook_id}")
 
         if not result or not isinstance(result, list) or len(result) == 0:
             return {"status": "no_research", "message": "No active research found"}
@@ -299,8 +293,6 @@ class ResearchMixin(BaseClient):
         if not sources:
             return []
 
-        client = self._get_client()
-
         # Build source array for import
         source_array = []
 
@@ -374,14 +366,41 @@ class ResearchMixin(BaseClient):
             source_array.append(source_data)
 
         params = [None, [1], task_id, notebook_id, source_array]
-        body = self._build_request_body(self.RPC_IMPORT_RESEARCH, params)
-        url = self._build_url(self.RPC_IMPORT_RESEARCH, f"/notebook/{notebook_id}")
 
-        response = client.post(url, content=body, timeout=timeout)
-        response.raise_for_status()
+        # Snapshot existing source IDs before the import so we can detect
+        # newly-landed sources during reconciliation if the RPC returns an
+        # accepted-pending error (code 3 or 9).
+        try:
+            pre_sources = self.get_notebook_sources_with_types(notebook_id)
+            pre_ids: set[str] = {s["id"] for s in pre_sources if s.get("id")}
+        except Exception:
+            pre_ids = set()
 
-        parsed = self._parse_response(response.text)
-        result = self._extract_rpc_result(parsed, self.RPC_IMPORT_RESEARCH)
+        try:
+            result = self._call_rpc(
+                self.RPC_IMPORT_RESEARCH, params, f"/notebook/{notebook_id}", timeout=timeout
+            )
+        except RPCError as e:
+            if e.error_code not in (3, 9):
+                raise
+            # Accepted-pending: check whether any new sources appeared.
+            result = None
+            for _attempt in range(3):
+                time.sleep(1.5)
+                try:
+                    post_sources = self.get_notebook_sources_with_types(notebook_id)
+                    new_sources = [
+                        s for s in post_sources if s.get("id") and s["id"] not in pre_ids
+                    ]
+                    if new_sources:
+                        return [
+                            {"id": s["id"], "title": s.get("title", "Untitled")}
+                            for s in new_sources
+                        ]
+                except Exception:
+                    pass
+            # Nothing landed after polling — surface the original error.
+            raise
 
         imported_sources = []
         if result and isinstance(result, list):

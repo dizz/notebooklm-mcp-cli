@@ -27,6 +27,17 @@ from starlette.responses import JSONResponse, Response
 
 from notebooklm_tools import __version__
 
+_FALSY = frozenset({"false", "0", "no", "off"})
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    """Read a boolean from an environment variable. Unset/empty → *default*; otherwise ``false|0|no|off`` (case-insensitive) → False, anything else → True."""
+    raw = os.environ.get(name, "")
+    if not raw:
+        return default
+    return raw.lower() not in _FALSY
+
+
 # Initialize MCP server
 mcp = FastMCP(
     name="notebooklm",
@@ -62,7 +73,7 @@ async def health_check(request: Request) -> JSONResponse:
     )
 
 
-def _register_tools():
+def _register_tools() -> None:
     """Import and register all tools from the modular tools package."""
     # Import all tool modules to populate the registry
     from .tools import (  # noqa: F401
@@ -72,6 +83,7 @@ def _register_tools():
         cross_notebook,
         downloads,
         exports,
+        labels,
         notebooks,
         notes,
         pipeline,
@@ -142,7 +154,7 @@ def _setup_oauth(server: FastMCP, client_id: str, client_secret: str,
     return provider, middleware
 
 
-def main():
+def main() -> None:
     """Run the MCP server.
 
     Supports multiple transports:
@@ -150,6 +162,10 @@ def main():
     - http: Streamable HTTP for network access
     - sse: Legacy SSE transport (backwards compatibility)
     """
+    from notebooklm_tools.utils.io_encoding import configure_stdio_utf8_on_windows
+
+    configure_stdio_utf8_on_windows()
+
     parser = argparse.ArgumentParser(
         description="NotebookLM MCP Server",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -159,8 +175,8 @@ Environment Variables:
   NOTEBOOKLM_MCP_HOST          Host to bind (default: 127.0.0.1)
   NOTEBOOKLM_MCP_PORT          Port to listen on (default: 8000)
   NOTEBOOKLM_MCP_PATH          MCP endpoint path (default: /mcp)
-  NOTEBOOKLM_MCP_STATELESS     Enable stateless mode for scaling (true/false)
-  NOTEBOOKLM_MCP_DEBUG         Enable debug logging (true/false)
+  NOTEBOOKLM_MCP_STATELESS     Stateless HTTP sessions (default: true, set false to disable)
+  NOTEBOOKLM_MCP_DEBUG         Debug logging (default: false)
   NOTEBOOKLM_HL                Interface language and default artifact language (default: en)
   NOTEBOOKLM_QUERY_TIMEOUT     Query timeout in seconds (default: 120.0)
 
@@ -205,14 +221,14 @@ Examples:
     )
     parser.add_argument(
         "--stateless",
-        action="store_true",
-        default=os.environ.get("NOTEBOOKLM_MCP_STATELESS", "").lower() == "true",
-        help="Enable stateless mode for horizontal scaling",
+        action=argparse.BooleanOptionalAction,
+        default=_env_bool("NOTEBOOKLM_MCP_STATELESS", default=True),
+        help="Stateless HTTP sessions (default: true). Avoids MCP SDK double-response crash (python-sdk#2416)",
     )
     parser.add_argument(
         "--debug",
-        action="store_true",
-        default=os.environ.get("NOTEBOOKLM_MCP_DEBUG", "").lower() == "true",
+        action=argparse.BooleanOptionalAction,
+        default=_env_bool("NOTEBOOKLM_MCP_DEBUG"),
         help="Enable debug logging",
     )
     parser.add_argument(
@@ -276,26 +292,72 @@ Examples:
     # Run server with appropriate transport
     # show_banner=False prevents Rich box-drawing output that can corrupt
     # the JSON-RPC protocol on Windows (especially with non-English locales)
+    import sys
+
     if args.transport == "stdio":
+
+        class _StdoutToStderrWrapper:
+            """Redirects sys.stdout.write to sys.stderr, but preserves original buffer.
+
+            This ensures that stray print() statements and logs go to stderr and do not
+            corrupt the MCP JSON-RPC protocol on stdout, while allowing the MCP SDK to
+            write the JSON-RPC messages to the original stdout buffer.
+            """
+
+            def __init__(self, original_stdout):
+                self._original_stdout = original_stdout
+                self.buffer = getattr(original_stdout, "buffer", original_stdout)
+
+            def write(self, s):
+                return sys.stderr.write(s)
+
+            def flush(self):
+                sys.stderr.flush()
+
+            def __getattr__(self, name):
+                return getattr(self._original_stdout, name)
+
+        sys.stdout = _StdoutToStderrWrapper(sys.stdout)
+
         mcp.run(show_banner=False)
-    elif args.transport == "http":
-        mcp.run(
-            transport="streamable-http",
-            host=args.host,
-            port=args.port,
-            path=args.path,
-            stateless_http=args.stateless,
-            middleware=oauth_middleware or None,
-            show_banner=False,
-        )
-    elif args.transport == "sse":
-        mcp.run(
-            transport="sse",
-            host=args.host,
-            port=args.port,
-            middleware=oauth_middleware or None,
-            show_banner=False,
-        )
+    elif args.transport in ("http", "sse"):
+        _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+        if args.host not in _LOOPBACK_HOSTS:
+            if not _env_bool("NOTEBOOKLM_ALLOW_EXTERNAL_BIND"):
+                print(
+                    f"SECURITY ERROR: Refusing to bind to non-loopback address '{args.host}'.\n"
+                    "There is no built-in authentication — binding externally exposes\n"
+                    "your Google cookies to anyone on the network.\n\n"
+                    "To override, set: NOTEBOOKLM_ALLOW_EXTERNAL_BIND=1",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            import warnings
+
+            warnings.warn(
+                f"SECURITY WARNING: {args.transport.upper()} transport is bound to a "
+                f"non-loopback address ('{args.host}'). There is no built-in "
+                "authentication. Do not expose this port to untrusted networks.",
+                stacklevel=2,
+            )
+        if args.transport == "http":
+            mcp.run(
+                transport="streamable-http",
+                host=args.host,
+                port=args.port,
+                path=args.path,
+                stateless_http=args.stateless,
+                middleware=oauth_middleware or None,
+                show_banner=False,
+            )
+        else:
+            mcp.run(
+                transport="sse",
+                host=args.host,
+                port=args.port,
+                middleware=oauth_middleware or None,
+                show_banner=False,
+            )
 
 
 if __name__ == "__main__":

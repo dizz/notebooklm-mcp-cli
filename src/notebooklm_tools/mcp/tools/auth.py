@@ -1,14 +1,21 @@
 """Auth tools - Authentication management."""
 
+import os
 import time
 import urllib.parse
-from typing import Any
 
-from ._utils import ESSENTIAL_COOKIES, get_client, logged_tool, reset_client
+from ._utils import (
+    ESSENTIAL_COOKIES,
+    ResultDict,
+    error_result,
+    get_client,
+    logged_tool,
+    reset_client,
+)
 
 
 @logged_tool()
-def refresh_auth() -> dict[str, Any]:
+def refresh_auth() -> ResultDict:
     """Reload auth tokens from disk or run headless re-authentication.
 
     Call this after running `nlm login` to pick up new tokens,
@@ -17,6 +24,18 @@ def refresh_auth() -> dict[str, Any]:
     Returns status indicating if tokens were refreshed successfully.
     """
     try:
+        # If NOTEBOOKLM_COOKIES is set in the environment (e.g. claude_desktop_config.json),
+        # it overrides all disk-based auth. Disk reload won't help — the env var wins on
+        # every client re-init. Tell the user exactly what to do instead of lying with "success".
+        if os.environ.get("NOTEBOOKLM_COOKIES"):
+            return error_result(
+                "NOTEBOOKLM_COOKIES is set as an environment variable in your MCP config. "
+                "This overrides all other auth sources (auth.json, nlm login, save_auth_tokens). "
+                "To fix: update the cookie value in your MCP config file "
+                "(e.g. claude_desktop_config.json) and restart, "
+                "or remove the NOTEBOOKLM_COOKIES env var and use 'nlm login' instead."
+            )
+
         # Try reloading from disk first
         from notebooklm_tools.core.auth import load_cached_tokens
 
@@ -50,7 +69,7 @@ def refresh_auth() -> dict[str, Any]:
             "error": "No cached tokens found. Run 'nlm login' to authenticate.",
         }
     except Exception as e:
-        return {"status": "error", "error": str(e)}
+        return error_result(str(e))
 
 
 @logged_tool()
@@ -60,7 +79,7 @@ def save_auth_tokens(
     session_id: str = "",
     request_body: str = "",
     request_url: str = "",
-) -> dict[str, Any]:
+) -> ResultDict:
     """Save NotebookLM cookies (FALLBACK method - try `nlm login` first!).
 
     IMPORTANT FOR AI ASSISTANTS:
@@ -82,7 +101,7 @@ def save_auth_tokens(
         for part in cookies.split("; "):
             if "=" in part:
                 key, value = part.split("=", 1)
-                all_cookies[key] = value
+                all_cookies[key.strip()] = value
 
         # Validate required cookies
         required = ["SID", "HSID", "SSID", "APISID", "SAPISID"]
@@ -143,4 +162,4 @@ def save_auth_tokens(
             "extracted_session_id": bool(session_id),
         }
     except Exception as e:
-        return {"status": "error", "error": str(e)}
+        return error_result(str(e))

@@ -1,16 +1,15 @@
 """Source CLI commands."""
 
 import typer
-from rich.console import Console
 
 from notebooklm_tools.cli.formatters import detect_output_format, get_formatter
-from notebooklm_tools.cli.utils import get_client, handle_error
+from notebooklm_tools.cli.utils import get_client, handle_error, make_console
 from notebooklm_tools.core.alias import get_alias_manager
 from notebooklm_tools.core.exceptions import NLMError
 from notebooklm_tools.services import ServiceError
 from notebooklm_tools.services import sources as sources_service
 
-console = Console()
+console = make_console()
 app = typer.Typer(
     help="Manage sources",
     rich_markup_mode="rich",
@@ -67,6 +66,11 @@ def add_source(
     title: str = typer.Option("", "--title", help="Title for the source"),
     doc_type: str = typer.Option("doc", "--type", help="Drive doc type: doc, slides, sheets, pdf"),
     wait: bool = typer.Option(False, "--wait", "-w", help="Wait for source processing to complete"),
+    wait_timeout: float = typer.Option(
+        600.0,
+        "--wait-timeout",
+        help="Max seconds to wait when --wait is set (default 600; raise for very long audio)",
+    ),
     profile: str | None = typer.Option(None, "--profile", "-p", help="Profile to use"),
 ) -> None:
     """Add a source to a notebook.
@@ -119,6 +123,7 @@ def add_source(
                     notebook_id,
                     [{"source_type": "url", "url": u} for u in all_urls],
                     wait=wait,
+                    wait_timeout=wait_timeout,
                 )
                 ready_msg = " (ready)" if wait else ""
                 for r in bulk_result["results"]:
@@ -144,6 +149,7 @@ def add_source(
                     "url",
                     url=source_url,
                     wait=wait,
+                    wait_timeout=wait_timeout,
                 )
             elif text:
                 if wait:
@@ -155,6 +161,7 @@ def add_source(
                     text=text,
                     title=title or None,
                     wait=wait,
+                    wait_timeout=wait_timeout,
                 )
             elif drive:
                 if wait:
@@ -169,6 +176,7 @@ def add_source(
                     title=title or None,
                     doc_type=doc_type,
                     wait=wait,
+                    wait_timeout=wait_timeout,
                 )
             elif file:
                 from pathlib import Path
@@ -185,7 +193,9 @@ def add_source(
                     notebook_id,
                     "file",
                     file_path=str(file_path),
+                    title=title or None,
                     wait=wait,
+                    wait_timeout=wait_timeout,
                 )
             else:
                 raise typer.Exit(1)
@@ -252,7 +262,7 @@ def get_source_content(
         if output:
             from pathlib import Path
 
-            Path(output).write_text(content["content"])
+            Path(output).write_text(content["content"], encoding="utf-8")
             console.print(
                 f"[green]✓[/green] Wrote {content['char_count']:,} characters to {output}"
             )

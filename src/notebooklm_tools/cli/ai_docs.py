@@ -21,7 +21,7 @@ nlm version {version}
 ```bash
 nlm login
 ```
-This opens NotebookLM in your browser (Chrome, Arc, Brave, Edge, or any Chromium-based browser) and extracts cookies automatically.
+This opens NotebookLM in your browser (Chrome, Arc, Brave, Edge, Chromium, or another supported Chromium-family browser) and extracts cookies automatically.
 Output on success: `✓ Successfully authenticated!`
 
 ### Check If Already Authenticated
@@ -232,7 +232,7 @@ nlm source add <notebook-id> --file doc.pdf --wait          # Upload and wait un
 nlm source add <notebook-id> --drive <doc-id>              # Add Drive doc
 nlm source add <notebook-id> --drive <doc-id> --type slides  # Add Drive slides
 # Types: doc, slides, sheets, pdf
-# Supported file types: PDF, TXT, MD, DOCX, CSV, MP3, M4A, WAV, AAC, OGG, OPUS, MP4, JPG, JPEG, PNG, GIF, WEBP
+# Supported file types: PDF, TXT, MD, DOCX, CSV, EPUB, MP3, M4A, WAV, AAC, OGG, OPUS, MP4, JPG, JPEG, PNG, GIF, WEBP
 
 nlm source get <source-id>             # Get source metadata
 nlm source get <source-id> --json      # JSON output
@@ -254,6 +254,7 @@ nlm list sources <notebook-id>         # List sources
 nlm add url <notebook-id> <url>        # Add URL source
 nlm add url <notebook-id> <url> --wait # Add URL and wait until processed
 nlm add text <notebook-id> "content" --title "Title"  # Add text source
+# Note: verb-first `add text` takes the text as a positional argument, not --text
 nlm add drive <notebook-id> <doc-id>   # Add Drive source
 nlm get source <source-id>             # Get source metadata
 nlm describe source <source-id>        # AI summary + keywords
@@ -303,6 +304,7 @@ nlm research start "query" --notebook-id <id>                    # Fast web (def
 nlm research start "query" --notebook-id <id> --mode deep        # Deep web (~5min)
 nlm research start "query" --notebook-id <id> --source drive     # Fast drive
 nlm research start "query" --notebook-id <id> --force            # Override pending
+nlm research start "query" --notebook-id <id> --auto-import      # Auto wait and import
 
 # Check progress
 nlm research status <notebook-id>                    # Poll until done (5min max)
@@ -313,6 +315,7 @@ nlm research status <notebook-id> --full             # Full details
 # Import discovered sources
 nlm research import <notebook-id> <task-id>              # Import all
 nlm research import <notebook-id> <task-id> --indices 0,2,5  # Import specific
+nlm research import <notebook-id> <task-id> --cited-only     # Import cited sources
 nlm research import <notebook-id> <task-id> --timeout 600    # Custom timeout (default: 300s)
 ```
 
@@ -433,6 +436,7 @@ nlm create slides <notebook-id> --length short --format detailed_deck --confirm
 ```bash
 nlm slides revise <artifact-id> --slide '1 Make the title larger' --confirm
 nlm slides revise <artifact-id> --slide '1 Fix title' --slide '3 Remove image' --confirm
+# Each --slide value must be: '<slide-number> <instruction>'
 # Creates a NEW slide deck with revisions applied. Original is not modified.
 ```
 
@@ -567,7 +571,7 @@ nlm export to-sheets <notebook-id> <artifact-id>            # Export data table 
 
 **Noun-First:**
 ```bash
-nlm alias set <name> <uuid>     # Create/update alias (auto-detects type)
+nlm alias set <name> <id>       # Create/update alias (auto-detects notebook/source)
 nlm alias get <name>            # Get UUID for alias
 nlm alias list                  # List all aliases
 nlm alias delete <name>         # Remove (no --confirm needed)
@@ -683,7 +687,8 @@ nlm skill show                              # Display skill content
 - `antigravity` - Antigravity agent framework (`~/.gemini/antigravity/skills/nlm-skill/`)
 - `cline` - Cline CLI terminal agent (`~/.cline/skills/nlm-skill/`)
 - `openclaw` - OpenClaw AI agent framework (`~/.openclaw/workspace/skills/nlm-skill/`)
-- `cc-claw` - CC-Claw AI agent framework (`~/.cc-claw/workspace/skills/nlm-skill/`)
+- `alef-agent` - Alef Agent AI agent framework (`~/.alef-agent/workspace/skills/nlm-skill/`)
+- `hermes` - Hermes Agent by NousResearch (`~/.hermes/skills/nlm-skill/`)
 - `other` - Export all formats to `./nlm-skill-export/` for manual installation
 
 **Installation Levels:**

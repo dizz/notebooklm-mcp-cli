@@ -42,6 +42,45 @@ class DownloadMixin(BaseClient):
     # Core Download Infrastructure
     # =========================================================================
 
+    def _audio_artifact_has_media_urls(self, artifact: list[Any]) -> bool:
+        """Return True when an audio artifact exposes media URLs."""
+        if len(artifact) <= 6:
+            return False
+
+        metadata = artifact[6]
+        if not isinstance(metadata, list) or len(metadata) <= 5:
+            return False
+
+        media_list = metadata[5]
+        if not isinstance(media_list, list):
+            return False
+
+        return any(
+            isinstance(item, list)
+            and len(item) > 0
+            and isinstance(item[0], str)
+            and item[0].startswith("http")
+            for item in media_list
+        )
+
+    def _is_audio_artifact_ready(self, artifact: list[Any]) -> bool:
+        """Treat verified ready audio payloads as downloadable.
+
+        Audio artifacts have been observed with status code ``2`` while already
+        exposing media URLs in their metadata. Keep support narrow to that
+        verified shape; everything else still requires the explicit completed
+        code.
+        """
+        if not isinstance(artifact, list) or len(artifact) <= 4:
+            return False
+        if artifact[2] != self.STUDIO_TYPE_AUDIO:
+            return False
+
+        status_code = artifact[4]
+        return status_code == 3 or (
+            status_code == 2 and self._audio_artifact_has_media_urls(artifact)
+        )
+
     async def _download_url(
         self,
         url: str,
@@ -83,10 +122,30 @@ class DownloadMixin(BaseClient):
             "_PAGE_FETCH_HEADERS",
             {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"},
         )
-        headers = {**base_headers, "Referer": f"{self._get_base_url()}/"}
+        # Mirror Chrome's window.open() from notebooklm.google.com to a cross-domain
+        # artifact host (lh3.googleusercontent.com / lh3.google.com). The audio CDN
+        # treats "Sec-Fetch-Site: none" as an address-bar navigation and returns 403;
+        # the UI's Download button succeeds because window.open() makes Chrome stamp
+        # the request with "Sec-Fetch-Site: cross-site" + Referer=notebooklm.google.com.
+        headers = {
+            **base_headers,
+            "Referer": f"{self._get_base_url()}/",
+            "Sec-Fetch-Site": "cross-site",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-User": "?1",
+        }
 
         # Use httpx.Cookies for proper cross-domain redirect handling
         cookies = self._get_httpx_cookies()
+
+        # Drop OSID cookies before issuing the download request.
+        # OSID is scoped to notebooklm.google.com; when it leaks onto download
+        # hosts (e.g. lh3.googleusercontent.com) Google treats the request as
+        # an invalid session and redirects to ServiceLogin, breaking downloads.
+        for domain in (".google.com", ".googleusercontent.com"):
+            cookies.delete("OSID", domain=domain)
+            cookies.delete("__Secure-OSID", domain=domain)
 
         # Per-chunk timeouts: 10s connect, 30s per chunk read/write
         # This allows large files to download without timeout while detecting stalls
@@ -172,15 +231,8 @@ class DownloadMixin(BaseClient):
         """Get raw artifact list for parsing download URLs."""
         # Poll params: [[2], notebook_id, 'NOT artifact.status = "ARTIFACT_STATUS_SUGGESTED"']
         params = [[2], notebook_id, 'NOT artifact.status = "ARTIFACT_STATUS_SUGGESTED"']
-        body = self._build_request_body(self.RPC_POLL_STUDIO, params)
-        url = self._build_url(self.RPC_POLL_STUDIO, f"/notebook/{notebook_id}")
 
-        client = self._get_client()
-        response = client.post(url, content=body)
-        response.raise_for_status()
-
-        parsed = self._parse_response(response.text)
-        result = self._extract_rpc_result(parsed, self.RPC_POLL_STUDIO)
+        result = self._call_rpc(self.RPC_POLL_STUDIO, params, path=f"/notebook/{notebook_id}")
 
         if result and isinstance(result, list) and len(result) > 0:
             # Response is an array of artifacts, possibly wrapped
@@ -211,12 +263,9 @@ class DownloadMixin(BaseClient):
         """
         artifacts = self._list_raw(notebook_id)
 
-        # Filter for completed audio (Type 1, Status 3)
-        candidates = []
-        for a in artifacts:
-            if isinstance(a, list) and len(a) > 4:  # noqa: SIM102
-                if a[2] == self.STUDIO_TYPE_AUDIO and a[4] == 3:
-                    candidates.append(a)
+        # Filter for ready audio artifacts. Some completed audio payloads use
+        # status code 2 while already exposing media URLs.
+        candidates = [a for a in artifacts if self._is_audio_artifact_ready(a)]
 
         if not candidates:
             raise ArtifactNotReadyError("audio")
@@ -239,14 +288,27 @@ class DownloadMixin(BaseClient):
             if not isinstance(media_list, list) or len(media_list) == 0:
                 raise ArtifactParseError("audio", details="No media URLs found in metadata")
 
-            # Look for audio/mp4 mime type
+            # Look for a downloadable audio/mp4 URL.
+            # Google's media list contains multiple entries:
+            #   =m140-dv  (priority 4, "download variant" — fast CDN via drum.usercontent.google.com)
+            #   =m140     (priority 1, streaming transcode — slow CDN via googlevideo.com)
+            # Prefer the "-dv" variant which is the intended download endpoint.
             url = None
             for item in media_list:
                 if isinstance(item, list) and len(item) > 2 and item[2] == "audio/mp4":
-                    url = item[0]
-                    break
+                    candidate = item[0]
+                    if isinstance(candidate, str) and candidate.endswith("-dv"):
+                        url = candidate
+                        break
 
-            # Fallback to first URL if no audio/mp4 found
+            # Fallback: any audio/mp4 URL
+            if not url:
+                for item in media_list:
+                    if isinstance(item, list) and len(item) > 2 and item[2] == "audio/mp4":
+                        url = item[0]
+                        break
+
+            # Last resort: first URL regardless of type
             if not url and len(media_list) > 0 and isinstance(media_list[0], list):
                 url = media_list[0][0]
 

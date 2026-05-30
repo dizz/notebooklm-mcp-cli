@@ -1,12 +1,17 @@
 """Sources service — shared validation and logic for source management."""
 
-from typing import TypedDict
+import urllib.parse
+from typing import Any
 
 from ..core.client import NotebookLMClient
+from ._compat import TypedDict
 from .errors import ServiceError, ValidationError
 
 VALID_SOURCE_TYPES = ("url", "text", "drive", "file")
 VALID_DRIVE_DOC_TYPES = ("doc", "slides", "sheets", "pdf")
+
+# Only allow safe, public URL schemes for URL sources
+ALLOWED_URL_SCHEMES = frozenset({"http", "https"})
 
 # MIME type mapping for Drive doc types
 DRIVE_MIME_TYPES = {
@@ -70,7 +75,7 @@ class DriveListResult(TypedDict):
     """Result of listing Drive sources."""
 
     drive_sources: list[DriveSourceInfo]
-    other_sources: list[dict]
+    other_sources: list[dict[str, object | None]]
     drive_count: int
     stale_count: int
 
@@ -142,6 +147,12 @@ def add_source(
         if source_type == "url":
             if not url:
                 raise ValidationError("url is required for source_type='url'")
+            parsed = urllib.parse.urlparse(url)
+            if not parsed.scheme or parsed.scheme.lower() not in ALLOWED_URL_SCHEMES:
+                raise ValidationError(
+                    f"URL scheme '{parsed.scheme}' is not allowed. "
+                    f"Only http:// and https:// URLs are supported."
+                )
             result = client.add_url_source(notebook_id, url, wait=wait, wait_timeout=wait_timeout)
             return _extract_result(result, "url", url)
 
@@ -176,9 +187,34 @@ def add_source(
         elif source_type == "file":
             if not file_path:
                 raise ValidationError("file_path is required for source_type='file'")
-            result = client.add_file(notebook_id, file_path, wait=wait, wait_timeout=wait_timeout)
+            # If a custom title was supplied we must wait for the source to be
+            # registered server-side before renaming — the NotebookLM rename
+            # RPC accepts the call and returns success data for a source that
+            # isn't yet fully registered, but the change silently never
+            # propagates. Force wait=True in that case so the source is ready
+            # when rename fires.
+            effective_wait = wait or bool(title)
+            result = client.add_file(
+                notebook_id, file_path, wait=effective_wait, wait_timeout=wait_timeout
+            )
             fallback_title = str(file_path).split("/")[-1]
-            return _extract_result(result, "file", fallback_title)
+            # `client.add_file` doesn't accept a title parameter (the NotebookLM
+            # upload RPC uses the filename), so we apply the caller's title via
+            # a follow-up rename_source call. Without this, --title was silently
+            # dropped for file uploads.
+            if title and result:
+                source_id = result.get("id") or result.get("source_id")
+                if source_id:
+                    try:
+                        renamed = client.rename_source(notebook_id, source_id, title)
+                        if renamed:
+                            result = {**result, "title": renamed.get("title", title)}
+                    except Exception:
+                        # Rename is best-effort: if it fails the source still
+                        # exists with the filename title. Don't mask the upload
+                        # success by raising here.
+                        pass
+            return _extract_result(result, "file", title or fallback_title)
 
     except (ValidationError, ServiceError):
         raise
@@ -199,7 +235,7 @@ def add_source(
 
 
 def _extract_result(
-    result: dict | None,
+    result: dict[str, Any] | None,
     source_type: str,
     fallback_title: str,
 ) -> AddSourceResult:
@@ -219,7 +255,7 @@ def _extract_result(
 def add_sources(
     client: NotebookLMClient,
     notebook_id: str,
-    sources: list[dict],
+    sources: list[dict[str, Any]],
     *,
     wait: bool = False,
     wait_timeout: float = 120.0,
@@ -350,10 +386,10 @@ def list_drive_sources(
         ) from e
 
     drive_sources: list[DriveSourceInfo] = []
-    other_sources: list[dict] = []
+    other_sources: list[dict[str, object | None]] = []
 
     for source in sources:
-        source_info: dict = {
+        source_info: dict[str, object | None] = {
             "id": source.get("id"),
             "title": source.get("title"),
             "type": source.get("source_type_name"),
@@ -361,9 +397,17 @@ def list_drive_sources(
 
         if source.get("can_sync"):
             is_fresh = client.check_source_freshness(source["id"])
-            source_info["stale"] = not is_fresh if is_fresh is not None else None
-            source_info["drive_doc_id"] = source.get("drive_doc_id")
-            drive_sources.append(source_info)
+            source_id = source.get("id")
+            source_title = source.get("title")
+            source_type_name = source.get("source_type_name")
+            drive_info: DriveSourceInfo = {
+                "id": source_id if isinstance(source_id, str) else "",
+                "title": source_title if isinstance(source_title, str) else "",
+                "type": source_type_name if isinstance(source_type_name, str) else "unknown",
+                "stale": (not is_fresh) if is_fresh is not None else None,
+                "drive_doc_id": source.get("drive_doc_id"),
+            }
+            drive_sources.append(drive_info)
         else:
             other_sources.append(source_info)
 

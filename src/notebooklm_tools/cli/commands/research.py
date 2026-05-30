@@ -1,16 +1,15 @@
 """Research CLI commands."""
 
 import typer
-from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
-from notebooklm_tools.cli.utils import get_client, handle_error
+from notebooklm_tools.cli.utils import get_client, handle_error, make_console
 from notebooklm_tools.core.alias import get_alias_manager
 from notebooklm_tools.core.exceptions import NLMError
 from notebooklm_tools.services import ServiceError
 from notebooklm_tools.services import research as research_service
 
-console = Console()
+console = make_console()
 app = typer.Typer(
     help="Research and discover sources",
     rich_markup_mode="rich",
@@ -51,6 +50,12 @@ def start_research(
         "-f",
         help="Start new research even if one is already pending",
     ),
+    auto_import: bool = typer.Option(
+        False,
+        "--auto-import",
+        "--wait-and-import",
+        help="Wait for completion and automatically import sources",
+    ),
     profile: str | None = typer.Option(None, "--profile", "-p", help="Profile to use"),
 ) -> None:
     """
@@ -61,13 +66,21 @@ def start_research(
     and 'nlm research import' to add discovered sources to your notebook.
     """
     try:
-        if not notebook_id:
-            console.print("[red]Error:[/red] --notebook-id is required for research")
+        if not notebook_id and not title:
+            console.print("[red]Error:[/red] Either --notebook-id or --title is required")
             raise typer.Exit(1)
 
-        notebook_id = get_alias_manager().resolve(notebook_id)
+        if notebook_id:
+            notebook_id = get_alias_manager().resolve(notebook_id)
 
         with get_client(profile) as client:
+            if not notebook_id and title:
+                from notebooklm_tools.services import notebooks as notebook_service
+
+                nb_result = notebook_service.create_notebook(client, title=title)
+                notebook_id = nb_result["notebook_id"]
+                console.print(f"[green]✓[/green] Created new notebook: {title}")
+
             # Check for existing research before starting new one (CLI-only UX)
             if not force:
                 existing = client.poll_research(notebook_id)
@@ -117,9 +130,52 @@ def start_research(
         console.print(f"  Notebook ID: {notebook_id}")
         console.print(f"  Task ID: {result['task_id']}")
 
-        estimate = "~30 seconds" if mode == "fast" else "~5 minutes"
-        console.print(f"\n[dim]Estimated time: {estimate}[/dim]")
-        console.print(f"[dim]Run 'nlm research status {notebook_id}' to check progress.[/dim]")
+        if auto_import:
+            console.print("\n[dim]Waiting for research to complete...[/dim]")
+
+            # Use progress indicator from status command
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                console=console,
+            ) as progress:
+                progress.add_task("Gathering sources...", total=None)
+
+                # Use a larger timeout for deep mode
+                max_wait = 600 if mode == "deep" else 120
+                with get_client(profile) as import_client:
+                    poll_res = research_service.poll_research(
+                        import_client,
+                        notebook_id,
+                        task_id=result["task_id"],
+                        poll_interval=10,
+                        max_wait=max_wait,
+                    )
+
+            _display_research_status(poll_res, compact=True)
+
+            if poll_res["status"] == "completed":
+                console.print("\n[dim]Importing discovered sources...[/dim]")
+                with get_client(profile) as import_client:
+                    import_res = research_service.import_research(
+                        import_client, notebook_id, poll_res["task_id"]
+                    )
+                console.print(f"[green]✓[/green] {import_res['message']}")
+                for src in import_res.get("imported_sources", []):
+                    title = (
+                        src.get("title", "Unknown")
+                        if isinstance(src, dict)
+                        else getattr(src, "title", "Unknown")
+                    )
+                    console.print(f"  • {title}")
+            else:
+                console.print(
+                    "[yellow]Warning:[/yellow] Could not auto-import. Research may have timed out or failed."
+                )
+        else:
+            estimate = "~30 seconds" if mode == "fast" else "~5 minutes"
+            console.print(f"\n[dim]Estimated time: {estimate}[/dim]")
+            console.print(f"[dim]Run 'nlm research status {notebook_id}' to check progress.[/dim]")
     except (ServiceError, NLMError) as e:
         handle_error(e, json_output=locals().get("json_output", False))
 
@@ -269,6 +325,11 @@ def import_research(
         "-t",
         help="Import timeout in seconds (default: 300)",
     ),
+    cited_only: bool = typer.Option(
+        False,
+        "--cited-only",
+        help="Import only sources cited by the research report (overrides --indices)",
+    ),
     profile: str | None = typer.Option(None, "--profile", "-p", help="Profile to use"),
 ) -> None:
     """
@@ -315,6 +376,7 @@ def import_research(
                 task_id,
                 source_indices=source_indices,
                 timeout=timeout,
+                cited_only=cited_only,
             )
 
         console.print(f"[green]✓[/green] {result['message']}")

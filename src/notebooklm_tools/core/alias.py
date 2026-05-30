@@ -40,7 +40,7 @@ class AliasManager:
             return
 
         try:
-            content = self.aliases_file.read_text()
+            content = self.aliases_file.read_text(encoding="utf-8")
             if content:
                 raw_data = json.loads(content)
                 # Convert to AliasEntry objects (handles legacy format)
@@ -55,7 +55,9 @@ class AliasManager:
         """Save aliases to disk."""
         self.config_dir.mkdir(parents=True, exist_ok=True)
         data = {name: entry.to_dict() for name, entry in self._aliases.items()}
-        self.aliases_file.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+        self.aliases_file.write_text(
+            json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
 
     def set_alias(self, name: str, value: str, alias_type: str = "unknown") -> None:
         """Set an alias with optional type."""
@@ -113,6 +115,8 @@ def detect_id_type(value: str, profile: str | None = None) -> str:
     """
     from notebooklm_tools.cli.utils import get_client
     from notebooklm_tools.core.exceptions import NLMError
+    from notebooklm_tools.services.errors import ServiceError
+    from notebooklm_tools.services.sources import get_source_content
 
     try:
         with get_client(profile) as client:
@@ -126,11 +130,12 @@ def detect_id_type(value: str, profile: str | None = None) -> str:
 
             # Try as source ID
             try:
-                # Sources need a notebook context, but we can try to get source content
-                content = client.get_source_content(value)
+                # Reuse the supported source-content path instead of calling a
+                # non-existent legacy client method.
+                content = get_source_content(client, value)
                 if content:
                     return "source"
-            except NLMError:
+            except (NLMError, ServiceError, AttributeError):
                 pass
 
     except NLMError:

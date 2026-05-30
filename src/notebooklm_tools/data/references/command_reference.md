@@ -37,7 +37,7 @@ nlm --help             # Show help and exit
 
 ### nlm login
 
-Authenticate with NotebookLM using Chrome DevTools Protocol.
+Authenticate with NotebookLM using the managed browser auth flow.
 
 ```bash
 nlm login [OPTIONS]
@@ -50,7 +50,7 @@ nlm login [OPTIONS]
 | `--provider` | | Auth provider: `builtin` (default) or `openclaw` |
 | `--cdp-url` | | CDP endpoint URL for external provider mode (default: `http://127.0.0.1:18800`) |
 | `--legacy` | `-l` | Use browser-cookie3 fallback (not recommended) |
-| `--browser` | `-b` | Browser for legacy mode (chrome, firefox, edge) |
+| `--browser` | `-b` | Browser for legacy mode (chrome, chromium, edge) |
 | `--manual` | `-m` | Import cookies from file |
 | `--file` | `-f` | Cookie file path for manual mode |
 
@@ -355,6 +355,7 @@ nlm research start <query> [OPTIONS]
 | `--mode` | `fast` (default, ~30s) or `deep` (~5min, web only) |
 | `--source` | `web` (default) or `drive` |
 | `--force` | Override pending research |
+| `--auto-import` | Wait for completion and automatically import sources (alias: `--wait-and-import`) |
 | `--profile` | Use specific profile |
 
 ### nlm research status
@@ -383,6 +384,7 @@ nlm research import <notebook-id> <task-id> [OPTIONS]
 | Option | Description |
 |--------|-------------|
 | `--indices` | Comma-separated indices of sources to import (default: all) |
+| `--cited-only` | Import only sources cited by the research report (overrides `--indices`) |
 | `--profile` | Use specific profile |
 
 ---
@@ -510,8 +512,9 @@ nlm video create <notebook-id> [OPTIONS]
 
 | Option | Values | Default |
 |--------|--------|---------|
-| `--format` | `explainer`, `brief` | `explainer` |
-| `--style` | `auto_select`, `classic`, `whiteboard`, `kawaii`, `anime`, `watercolor`, `retro_print`, `heritage`, `paper_craft` | `auto_select` |
+| `--format` | `explainer`, `brief`, `cinematic` | `explainer` |
+| `--style` | `auto_select`, `custom`, `classic`, `whiteboard`, `kawaii`, `anime`, `watercolor`, `retro_print`, `heritage`, `paper_craft` | `auto_select` |
+| `--style-prompt` | Custom visual style text (requires `--style custom`, or implies it when `--style` omitted) | |
 | `--focus` | Focus text/topic | |
 
 ### nlm data-table create
@@ -761,13 +764,13 @@ nlm chat configure <notebook-id> [OPTIONS]
 
 ### nlm alias set
 
-Create or update an alias for a UUID.
+Create or update an alias for a NotebookLM ID.
 
 ```bash
-nlm alias set <name> <uuid>
+nlm alias set <name> <id>
 ```
 
-Type is auto-detected (notebook, source, artifact, task).
+Type is auto-detected. Notebook and source IDs are verified automatically.
 
 ### nlm alias get
 

@@ -206,6 +206,85 @@ class TestBrowserDetection:
             "No user-local (AppData) entries found in Windows candidate list"
         )
 
+
+class TestCDPStartupHandling:
+    """Tests for CDP startup timing and diagnostics."""
+
+    def test_get_debugger_url_uses_ipv4_loopback(self):
+        """CDP version probe should use 127.0.0.1 consistently."""
+        from notebooklm_tools.utils.cdp import get_debugger_url
+
+        with patch("notebooklm_tools.utils.cdp.httpx_client.get") as mock_get:
+            mock_get.return_value.json.return_value = {
+                "webSocketDebuggerUrl": "ws://localhost:9222/devtools/browser/test"
+            }
+
+            url = get_debugger_url(9222)
+
+        mock_get.assert_called_once_with("http://127.0.0.1:9222/json/version", timeout=5)
+        assert url == "ws://127.0.0.1:9222/devtools/browser/test"
+
+    def test_extract_cookies_waits_longer_for_cdp_debugger(self):
+        """Slow browser startups should get a longer CDP wait window."""
+        from notebooklm_tools.utils.cdp import extract_cookies_via_cdp
+
+        with (
+            patch("notebooklm_tools.utils.cdp._kill_stale_nlm_browsers"),
+            patch("notebooklm_tools.utils.cdp.find_existing_nlm_chrome", return_value=(None, None)),
+            patch(
+                "notebooklm_tools.utils.cdp.find_any_existing_cdp_browser",
+                return_value=(None, None),
+            ),
+            patch("notebooklm_tools.utils.cdp.is_profile_locked", return_value=False),
+            patch("notebooklm_tools.utils.cdp.get_chrome_path", return_value="chromium"),
+            patch("notebooklm_tools.utils.cdp.find_available_port", return_value=9222),
+            patch("notebooklm_tools.utils.cdp.launch_chrome", return_value=True),
+            patch(
+                "notebooklm_tools.utils.cdp.get_debugger_url",
+                return_value="ws://127.0.0.1:9222/devtools/browser/test",
+            ) as mock_get_debugger_url,
+            patch(
+                "notebooklm_tools.utils.cdp.extract_cookies_from_page",
+                return_value={"cookies": [], "csrf_token": "", "session_id": "", "email": ""},
+            ),
+        ):
+            extract_cookies_via_cdp()
+
+        mock_get_debugger_url.assert_called_once_with(9222, tries=30)
+
+    def test_extract_cookies_does_not_reuse_unmapped_cdp_browser(self):
+        """Default login should not attach to an unrelated CDP browser."""
+        from notebooklm_tools.utils.cdp import extract_cookies_via_cdp
+
+        with (
+            patch("notebooklm_tools.utils.cdp._kill_stale_nlm_browsers"),
+            patch("notebooklm_tools.utils.cdp.find_existing_nlm_chrome", return_value=(None, None)),
+            patch(
+                "notebooklm_tools.utils.cdp.find_any_existing_cdp_browser",
+                return_value=(9222, "ws://127.0.0.1:9222/devtools/browser/test"),
+            ) as mock_find_any,
+            patch("notebooklm_tools.utils.cdp.is_profile_locked", return_value=False),
+            patch("notebooklm_tools.utils.cdp.get_chrome_path", return_value="chromium"),
+            patch("notebooklm_tools.utils.cdp.find_available_port", return_value=9223),
+            patch(
+                "notebooklm_tools.utils.cdp.launch_chrome", return_value=True
+            ) as mock_launch_chrome,
+            patch(
+                "notebooklm_tools.utils.cdp.get_debugger_url",
+                return_value="ws://127.0.0.1:9223/devtools/browser/test",
+            ),
+            patch(
+                "notebooklm_tools.utils.cdp.extract_cookies_from_page",
+                return_value={"cookies": [], "csrf_token": "", "session_id": "", "email": ""},
+            ) as mock_extract,
+        ):
+            result = extract_cookies_via_cdp()
+
+        mock_find_any.assert_not_called()
+        mock_launch_chrome.assert_called_once_with(9223, profile_name="default")
+        mock_extract.assert_called_once_with("http://127.0.0.1:9223", True, 300)
+        assert result["reused_existing"] is False
+
     # ------------------------------------------------------------------
     # get_chrome_path — macOS
     # ------------------------------------------------------------------
@@ -260,8 +339,7 @@ class TestBrowserDetection:
     # ------------------------------------------------------------------
 
     def test_get_chrome_path_linux_returns_first_found(self):
-        """On Linux, get_chrome_path returns the command name (not full path) of the
-        first executable found — shutil.which resolution is the caller's concern."""
+        """On Linux, get_chrome_path returns the full path from shutil.which."""
         from notebooklm_tools.utils.cdp import get_chrome_path
 
         def fake_which(cmd):
@@ -272,8 +350,7 @@ class TestBrowserDetection:
             patch("notebooklm_tools.utils.cdp.shutil.which", side_effect=fake_which),
         ):
             result = get_chrome_path()
-        # get_chrome_path returns the raw executable name, not the resolved path
-        assert result == "brave-browser"
+        assert result == "/usr/bin/brave-browser"
 
     def test_get_chrome_path_linux_returns_none_when_nothing_found(self):
         """On Linux, get_chrome_path returns None when no browser is on PATH."""
@@ -313,7 +390,7 @@ class TestBrowserDetection:
             patch("notebooklm_tools.utils.cdp.shutil.which", side_effect=fake_which),
         ):
             result = get_chrome_path()
-        assert result == "google-chrome"
+        assert result == "/usr/bin/google-chrome"
 
     # ------------------------------------------------------------------
     # get_chrome_path — Windows
@@ -412,6 +489,10 @@ class TestBrowserErrorMessages:
             patch("notebooklm_tools.utils.cdp.platform.system", return_value="Darwin"),
             patch("notebooklm_tools.utils.cdp.get_chrome_path", return_value=None),
             patch("notebooklm_tools.utils.cdp.find_existing_nlm_chrome", return_value=(None, None)),
+            patch(
+                "notebooklm_tools.utils.cdp.find_any_existing_cdp_browser",
+                return_value=(None, None),
+            ),
             patch("notebooklm_tools.utils.cdp.is_profile_locked", return_value=False),
         ):
             with pytest.raises(AuthenticationError) as exc_info:
@@ -430,6 +511,10 @@ class TestBrowserErrorMessages:
             patch("notebooklm_tools.utils.cdp.platform.system", return_value="Linux"),
             patch("notebooklm_tools.utils.cdp.get_chrome_path", return_value=None),
             patch("notebooklm_tools.utils.cdp.find_existing_nlm_chrome", return_value=(None, None)),
+            patch(
+                "notebooklm_tools.utils.cdp.find_any_existing_cdp_browser",
+                return_value=(None, None),
+            ),
             patch("notebooklm_tools.utils.cdp.is_profile_locked", return_value=False),
         ):
             with pytest.raises(AuthenticationError) as exc_info:
@@ -449,6 +534,10 @@ class TestBrowserErrorMessages:
             patch("notebooklm_tools.utils.cdp.platform.system", return_value="Windows"),
             patch("notebooklm_tools.utils.cdp.get_chrome_path", return_value=None),
             patch("notebooklm_tools.utils.cdp.find_existing_nlm_chrome", return_value=(None, None)),
+            patch(
+                "notebooklm_tools.utils.cdp.find_any_existing_cdp_browser",
+                return_value=(None, None),
+            ),
             patch("notebooklm_tools.utils.cdp.is_profile_locked", return_value=False),
         ):
             with pytest.raises(AuthenticationError) as exc_info:
@@ -467,6 +556,10 @@ class TestBrowserErrorMessages:
         with (  # noqa: SIM117
             patch("notebooklm_tools.utils.cdp.get_chrome_path", return_value=None),
             patch("notebooklm_tools.utils.cdp.find_existing_nlm_chrome", return_value=(None, None)),
+            patch(
+                "notebooklm_tools.utils.cdp.find_any_existing_cdp_browser",
+                return_value=(None, None),
+            ),
             patch("notebooklm_tools.utils.cdp.is_profile_locked", return_value=False),
         ):
             with pytest.raises(AuthenticationError) as exc_info:
@@ -481,6 +574,10 @@ class TestBrowserErrorMessages:
         with (  # noqa: SIM117
             patch("notebooklm_tools.utils.cdp.get_chrome_path", return_value=None),
             patch("notebooklm_tools.utils.cdp.find_existing_nlm_chrome", return_value=(None, None)),
+            patch(
+                "notebooklm_tools.utils.cdp.find_any_existing_cdp_browser",
+                return_value=(None, None),
+            ),
             patch("notebooklm_tools.utils.cdp.is_profile_locked", return_value=False),
         ):
             with pytest.raises(AuthenticationError) as exc_info:
@@ -496,6 +593,10 @@ class TestBrowserErrorMessages:
         with (  # noqa: SIM117
             patch("notebooklm_tools.utils.cdp.get_chrome_path", return_value="/some/browser"),
             patch("notebooklm_tools.utils.cdp.find_existing_nlm_chrome", return_value=(None, None)),
+            patch(
+                "notebooklm_tools.utils.cdp.find_any_existing_cdp_browser",
+                return_value=(None, None),
+            ),
             patch("notebooklm_tools.utils.cdp.is_profile_locked", return_value=False),
             patch("notebooklm_tools.utils.cdp.find_available_port", return_value=9222),
             patch("notebooklm_tools.utils.cdp.launch_chrome", return_value=False),
@@ -513,6 +614,10 @@ class TestBrowserErrorMessages:
         with (  # noqa: SIM117
             patch("notebooklm_tools.utils.cdp.get_chrome_path", return_value="/some/browser"),
             patch("notebooklm_tools.utils.cdp.find_existing_nlm_chrome", return_value=(None, None)),
+            patch(
+                "notebooklm_tools.utils.cdp.find_any_existing_cdp_browser",
+                return_value=(None, None),
+            ),
             patch("notebooklm_tools.utils.cdp.is_profile_locked", return_value=False),
             patch("notebooklm_tools.utils.cdp.find_available_port", return_value=9222),
             patch("notebooklm_tools.utils.cdp.launch_chrome", return_value=True),

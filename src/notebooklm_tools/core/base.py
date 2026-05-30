@@ -13,15 +13,18 @@ import logging
 import os
 import random
 import re
+import threading
 import urllib.parse
 from typing import Any
 
 import httpx
 
+from notebooklm_tools.utils.config import get_base_url
+
 from . import constants
 from .data_types import ConversationTurn
 from .errors import ClientAuthenticationError as AuthenticationError
-from .errors import RPCError
+from .errors import ResourceExhaustedError, RPCError
 from .retry import DEFAULT_BASE_DELAY, DEFAULT_MAX_DELAY, DEFAULT_MAX_RETRIES, is_retryable_error
 from .utils import (
     RPC_NAMES,
@@ -29,11 +32,34 @@ from .utils import (
     _format_debug_json,
     _parse_url_params,
 )
-from notebooklm_tools.utils.config import get_base_url
 
 # Configure logger (API internals only logged at DEBUG level, usually disabled)
 logger = logging.getLogger("notebooklm_mcp.api")
 logger.setLevel(logging.WARNING)  # Suppress internal API logs by default
+
+
+def _extract_user_message(detail_data: Any, _depth: int = 0) -> str:
+    """Recursively extract human-readable strings from a protobuf detail payload.
+
+    UserDisplayableError payloads contain user-facing text buried in nested
+    lists. This walks the structure depth-first and returns all non-empty
+    strings joined by '; '. Capped at 20 levels to guard against malformed
+    responses.
+    """
+    if _depth > 20 or detail_data is None:
+        return ""
+    if isinstance(detail_data, str):
+        stripped = detail_data.strip()
+        return stripped if stripped else ""
+    if isinstance(detail_data, list):
+        parts: list[str] = []
+        for item in detail_data:
+            found = _extract_user_message(item, _depth + 1)
+            if found:
+                parts.append(found)
+        return "; ".join(parts)
+    return ""
+
 
 # Timeout configuration (seconds)
 DEFAULT_TIMEOUT = 30.0  # Default for most operations
@@ -85,7 +111,8 @@ class BaseClient:
     RPC_DELETE_NOTEBOOK = "WWINqb"
 
     # Source operations
-    RPC_ADD_SOURCE = "izAoDd"  # Used for URL, text, and Drive sources
+    RPC_ADD_SOURCE = "izAoDd"  # Used for URL, text, and Drive sources (legacy)
+    RPC_ADD_SOURCE_V2 = "ozz5Z"  # URL source addition (new rollout, issue #121)
     RPC_ADD_SOURCE_FILE = "o4cbdc"  # Register file for resumable upload
     RPC_GET_SOURCE = "hizoJc"  # Get source details
     RPC_CHECK_FRESHNESS = "yR9Yof"  # Check if Drive source is stale
@@ -97,7 +124,6 @@ class BaseClient:
     RPC_GET_CONVERSATIONS = "hPTbtc"
     RPC_DELETE_CHAT_HISTORY = "J7Gthc"
     RPC_PREFERENCES = "hT54vc"
-    RPC_SUBSCRIPTION = "ozz5Z"
     RPC_SETTINGS = "ZwVcOc"
     RPC_GET_SUMMARY = "VfAZjd"  # Get notebook summary and suggested report topics
     RPC_GET_SOURCE_GUIDE = "tr032e"  # Get source guide (AI summary + keyword chips)
@@ -127,6 +153,11 @@ class BaseClient:
     RPC_GET_NOTES = "cFji9"  # List notes and mind maps (same as LIST_MIND_MAPS)
     RPC_UPDATE_NOTE = "cYAfTb"  # Update note content/title
     RPC_DELETE_NOTE = "AH0mwd"  # Delete note permanently (same as DELETE_MIND_MAP)
+
+    # Label RPCs (source organization)
+    RPC_LABEL_MANAGE = "agX4Bc"  # Auto-label sources / create label / list labels
+    RPC_LABEL_MUTATE = "le8sX"  # Rename label / set emoji / move source to label
+    RPC_LABEL_DELETE = "GyzE7e"  # Delete one or more labels
 
     # Sharing RPCs
     RPC_SHARE_NOTEBOOK = "QDyure"  # Set sharing settings (visibility, collaborators)
@@ -224,6 +255,7 @@ class BaseClient:
     SOURCE_TYPE_GOOGLE_DOCS = constants.SOURCE_TYPE_GOOGLE_DOCS
     SOURCE_TYPE_GOOGLE_OTHER = constants.SOURCE_TYPE_GOOGLE_OTHER
     SOURCE_TYPE_PASTED_TEXT = constants.SOURCE_TYPE_PASTED_TEXT
+    SOURCE_TYPE_AUDIO = constants.SOURCE_TYPE_AUDIO
 
     # Sharing
     SHARE_ROLE_OWNER = constants.SHARE_ROLE_OWNER
@@ -274,11 +306,14 @@ class BaseClient:
             session_id: Session ID (optional - will be auto-extracted from page if not provided)
             build_label: Build label / bl param (optional - auto-extracted from page if not provided)
         """
+        import time as _time
+
         self.cookies = cookies
         self.csrf_token = csrf_token
         self._client: httpx.Client | None = None
         self._session_id = session_id
         self._bl = build_label
+        self._created_at: float = _time.time()
 
         # Conversation cache for follow-up queries
         # Key: conversation_id, Value: list of ConversationTurn objects
@@ -286,6 +321,20 @@ class BaseClient:
 
         # Request counter for _reqid parameter (required for query endpoint)
         self._reqid_counter = random.randint(100000, 999999)
+
+        # RPC version cache for URL source addition (issue #121).
+        # Google is rolling out a new RPC (ozz5Z) to replace izAoDd for URL sources.
+        # This caches which version works for this session to avoid double HTTP calls.
+        # Values: None (unresolved), "v1" (izAoDd), "v2" (ozz5Z)
+        self._source_rpc_version: str | None = None
+
+        # Lock for thread-safe access to mutable instance state.
+        # FastMCP dispatches sync tool functions into a thread pool, so
+        # concurrent MCP tool calls share this singleton client instance.
+        # The lock protects: _client, _reqid_counter, _conversation_cache,
+        # _source_rpc_version, csrf_token, _session_id, cookies.
+        # It is never held during network I/O.
+        self._state_lock = threading.Lock()
 
         # Only refresh CSRF token if not provided - tokens actually last hours/days, not minutes
         # The retry logic in _call_rpc() handles expired tokens gracefully
@@ -356,12 +405,17 @@ class BaseClient:
     # =========================================================================
 
     def _get_client(self) -> httpx.Client:
-        """Get or create HTTP client."""
-        if self._client is None:
+        """Get or create HTTP client (thread-safe)."""
+        if self._client is not None:
+            return self._client
+        with self._state_lock:
+            # Double-checked locking: re-check inside lock
+            if self._client is not None:
+                return self._client
             # Use cookies object directly
             cookies = self._get_httpx_cookies()
 
-            self._client = httpx.Client(
+            client = httpx.Client(
                 cookies=cookies,
                 headers={
                     "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
@@ -375,8 +429,9 @@ class BaseClient:
 
             # Explicitly set headers if needed, though constructor handles most
             if self.csrf_token:
-                self._client.headers["X-Goog-Csrf-Token"] = self.csrf_token
+                client.headers["X-Goog-Csrf-Token"] = self.csrf_token
 
+            self._client = client
         return self._client
 
     def _get_async_client(self) -> httpx.AsyncClient:
@@ -517,8 +572,35 @@ class BaseClient:
                                                 detail_data = detail[1] if len(detail) > 1 else None
                                                 break
 
+                                    # Provide fallback names for common gRPC status codes
+                                    # if the backend didn't provide a specific detail_type
+                                    friendly_type = detail_type
+                                    if not friendly_type:
+                                        grpc_codes = {
+                                            3: "INVALID_ARGUMENT",
+                                            5: "NOT_FOUND",
+                                            7: "PERMISSION_DENIED",
+                                            8: "RESOURCE_EXHAUSTED",
+                                            16: "UNAUTHENTICATED",
+                                        }
+                                        friendly_type = grpc_codes.get(error_code, "unknown")
+
+                                    msg = f"API error (code {error_code}): {friendly_type}"
+
+                                    if "UserDisplayableError" in detail_type:
+                                        user_msg = _extract_user_message(detail_data)
+                                        if user_msg:
+                                            msg = f"API error (code {error_code}): {user_msg}"
+
+                                    if error_code == 8:
+                                        raise ResourceExhaustedError(
+                                            msg,
+                                            detail_type=detail_type,
+                                            detail_data=detail_data,
+                                        )
+
                                     raise RPCError(
-                                        f"API error (code {error_code}): {detail_type or 'unknown'}",
+                                        msg,
                                         error_code=error_code,
                                         detail_type=detail_type,
                                         detail_data=detail_data,
@@ -635,8 +717,12 @@ class BaseClient:
                 # Exhausted retries, re-raise
                 raise
 
-            # Check for auth failures (401/403 HTTP)
-            is_http_auth = e.response.status_code in (401, 403)
+            # Check for auth failures (400/401/403 HTTP)
+            # 400 is included because Google returns "400 Bad Request" when
+            # the CSRF token (at= body param) is expired or invalid, rather
+            # than a 401/403.  Our Layer-1 recovery (_refresh_auth_tokens)
+            # re-extracts a fresh CSRF token from the page, which fixes this.
+            is_http_auth = e.response.status_code in (400, 401, 403)
             if not is_http_auth:
                 # Not a retryable or auth error, re-raise immediately
                 raise
@@ -654,7 +740,8 @@ class BaseClient:
         if not _retry:
             try:
                 self._refresh_auth_tokens()
-                self._client = None
+                with self._state_lock:
+                    self._client = None
                 return self._call_rpc(rpc_id, params, path, timeout, _retry=True)
             except ValueError:
                 # CSRF refresh failed (cookies expired) - continue to layer 2
@@ -662,13 +749,22 @@ class BaseClient:
 
         # Layer 2 & 3: Reload from disk or run headless auth (deep retry)
         if not _deep_retry and self._try_reload_or_headless_auth():
-            self._client = None
+            with self._state_lock:
+                self._client = None
             return self._call_rpc(rpc_id, params, path, timeout, _retry=True, _deep_retry=True)
 
         # All recovery attempts failed
-        raise AuthenticationError(
-            "Authentication expired. Run 'nlm login' in your terminal to re-authenticate."
+        msg = (
+            "Authentication expired. Run 'nlm login' in your terminal to re-authenticate. "
+            "MCP users: the server should auto-detect the new credentials; "
+            "if not, call the refresh_auth tool."
         )
+        if os.environ.get("NOTEBOOKLM_COOKIES"):
+            msg += (
+                " NOTE: NOTEBOOKLM_COOKIES is set in your environment and overrides "
+                "all other auth sources. Update it in your MCP config file and restart."
+            )
+        raise AuthenticationError(msg)
 
     # =========================================================================
     # Authentication Management
@@ -717,26 +813,30 @@ class BaseClient:
                 from notebooklm_tools.utils.config import get_storage_dir
 
                 debug_dir = get_storage_dir()
-                debug_dir.mkdir(parents=True, exist_ok=True)
                 debug_path = debug_dir / "debug_page.html"
                 debug_path.write_text(html, encoding="utf-8")
+                import contextlib as _ctxlib
+
+                with _ctxlib.suppress(OSError):
+                    debug_path.chmod(0o600)
                 raise ValueError(
                     f"Could not extract CSRF token from page. "
                     f"Page saved to {debug_path} for debugging. "
                     f"The page structure may have changed."
                 )
 
-            self.csrf_token = csrf_token
-
             # Extract session ID (FdrFJe) - optional but helps
             sid_match = re.search(r'"FdrFJe":"([^"]+)"', html)
-            if sid_match:
-                self._session_id = sid_match.group(1)
 
             # Extract build label (cfb2h) - keeps bl param current
             bl_match = re.search(r'"cfb2h":"([^"]+)"', html)
-            if bl_match:
-                self._bl = bl_match.group(1)
+
+            with self._state_lock:
+                self.csrf_token = csrf_token
+                if sid_match:
+                    self._session_id = sid_match.group(1)
+                if bl_match:
+                    self._bl = bl_match.group(1)
 
             # Cache the extracted tokens to avoid re-fetching the page on next request
             self._update_cached_tokens()
@@ -780,20 +880,23 @@ class BaseClient:
 
         Returns True if new valid tokens were obtained, False otherwise.
         """
-        from .auth import get_cache_path, load_cached_tokens
+        from .auth import load_cached_tokens
 
-        # Check if auth.json has tokens - always try them since current tokens failed
-        cache_path = get_cache_path()
-        if cache_path.exists():
-            cached = load_cached_tokens()
-            if cached and cached.cookies:
-                # Always reload from disk when auth fails - current tokens are known-bad
-                # The cached tokens may be fresher (user ran nlm login)
-                # or the same, but worth retrying with a fresh CSRF token extraction
+        # Layer 2: Reload cookies from disk (profile or legacy auth.json).
+        # load_cached_tokens() checks the default profile first, then falls
+        # back to the legacy auth.json file.  We no longer gate on
+        # auth.json existence so that users who only have profile-based
+        # credentials (from `nlm login`) are not skipped.
+        cached = load_cached_tokens()
+        if cached and cached.cookies:
+            # Always reload from disk when auth fails - current tokens are known-bad
+            # The cached tokens may be fresher (user ran nlm login)
+            # or the same, but worth retrying with a fresh CSRF token extraction
+            with self._state_lock:
                 self.cookies = cached.cookies
                 self.csrf_token = ""  # Force re-extraction of CSRF token
                 self._session_id = ""  # Force re-extraction of session ID
-                return True
+            return True
 
         # Try headless auth if Chrome profile exists
         try:
@@ -801,9 +904,10 @@ class BaseClient:
 
             tokens = run_headless_auth()
             if tokens:
-                self.cookies = tokens.cookies
-                self.csrf_token = tokens.csrf_token
-                self._session_id = tokens.session_id
+                with self._state_lock:
+                    self.cookies = tokens.cookies
+                    self.csrf_token = tokens.csrf_token
+                    self._session_id = tokens.session_id
                 return True
         except Exception as e:
             logger.debug(f"Headless auth failed: {e}")

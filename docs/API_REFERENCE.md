@@ -161,6 +161,14 @@ research_import(
     source_indices=[0, 2, 5],  # Import only sources at indices 0, 2, and 5
     timeout=600  # Optional: increase for large notebooks (default: 300s)
 )
+
+# Or import only sources cited by the deep research report
+research_import(
+    notebook_id=notebook_id,
+    task_id=status["research"]["task_id"],
+    cited_only=True,  # Overrides source_indices when enabled
+    timeout=600
+)
 ```
 
 **Research Modes:**
@@ -182,8 +190,10 @@ result = audio_overview_create(
 # Create a video overview
 result = video_overview_create(
     notebook_id=notebook_id,
-    format="explainer",      # explainer, brief
-    visual_style="classic",  # auto_select, classic, whiteboard, kawaii, anime, etc.
+    format="explainer",      # explainer, brief, cinematic
+    visual_style="classic",  # auto_select, custom, classic, whiteboard, kawaii, anime, etc.
+    focus_prompt="",         # Optional host/content focus text
+    visual_style_prompt="",  # Optional custom style text when visual_style="custom"
     language="en",
     confirm=True
 )
@@ -207,8 +217,8 @@ studio_delete(
 
 **Audio Formats:** deep_dive (conversation), brief, critique, debate
 **Audio Lengths:** short, default, long
-**Video Formats:** explainer, brief
-**Video Styles:** auto_select, classic, whiteboard, kawaii, anime, watercolor, retro_print, heritage, paper_craft
+**Video Formats:** explainer, brief, cinematic
+**Video Styles:** auto_select, custom, classic, whiteboard, kawaii, anime, watercolor, retro_print, heritage, paper_craft
 
 ---
 
@@ -275,7 +285,7 @@ The `f.req` structure:
 | `hPTbtc` | Get conversation IDs | `[notebook_id]` |
 | `hT54vc` | User preferences | - |
 | `ZwVcOc` | Settings | - |
-| `ozz5Z` | Subscription info | - |
+| `ozz5Z` | Add source v2 (Unified) | See source types below |
 | `Ljjv0c` | Start Fast Research | `[["query", source_type], null, 1, "notebook_id"]` |
 | `QA9ei` | Start Deep Research | `[null, [1], ["query", source_type], 5, "notebook_id"]` |
 | `e3bVqc` | Poll Research Results | `[null, null, "notebook_id"]` |
@@ -641,10 +651,11 @@ params = [
             [
                 [[source_id1], [source_id2], ...],  # Source IDs
                 language_code,     # "en", "es", etc.
-                focus_prompt,      # Focus text
+                focus_prompt,      # Host/content focus text
                 None,
-                format_code,       # 1=Explainer, 2=Brief
-                visual_style_code  # 1=Auto, 2=Custom, 3=Classic, etc.
+                format_code,       # 1=Explainer, 2=Brief, 3=Cinematic
+                visual_style_code,  # 1=Auto, 3=Classic, etc. (null when using custom style text)
+                visual_style_prompt  # Present when visual_style="custom"
             ]
         ]
     ]
@@ -1485,3 +1496,271 @@ The MCP needs these cookies (automatically filtered from the full cookie header)
    - Subsequent requests reuse cached tokens
    - No fetching needed
    - Cache updates automatically when tokens are refreshed
+
+---
+
+## Label Management RPCs
+
+Labels allow users to organize sources into thematic categories. Available when a notebook has 5+ sources. Sources can belong to multiple labels.
+
+**UI operations available:**
+- Auto-label (AI generates categories from sources)
+- Create a new empty label
+- Rename a label
+- Set/change an emoji on a label
+- Remove a label (sources are preserved, not deleted)
+- Move a source to a different label (multi-label assignment via checkboxes)
+- Return to flat list view
+
+### `agX4Bc` — Auto-Label / Reorganize / Create Label / List Labels
+
+This RPC handles auto-labeling, force-reorganization, and manual label creation.
+The 5th parameter (mode) controls the labeling behavior:
+
+| Mode | Meaning |
+|------|---------|
+| `[]` | Return existing labels, or auto-generate if none exist |
+| `[0]` | Reorganize: only label sources not yet in any label (no confirmation in UI) |
+| `[1]` | Reorganize: force-regenerate ALL labels from scratch (UI shows confirmation dialog) |
+| `null` + 6th param | Create a new empty label with the given name/emoji |
+
+#### Auto-label all sources (returns existing if already labeled)
+
+```python
+# Request params
+[[2], notebook_id, null, null, []]
+
+# Example
+[[2], "180cfc20-9d9f-4ebf-a5d3-1b50d5593b8b", null, null, []]
+
+# Response: [null, [[label_name, [[src_id], ...], label_id, emoji], ...]]
+[null, [
+    ["User Tutorials",
+     [["0baf49b7-..."], ["86132bc5-..."], ["acd49c62-..."]],
+     "0245af0d-2663-40df-96b9-567f7ed1ce6f",
+     ""],  # emoji (empty string = no emoji)
+    ["Enterprise Use Cases",
+     [["845deae5-..."], ["86132bc5-..."], ["98881af4-..."]],
+     "286c7cc0-39f3-4349-940f-ea50e34169eb",
+     ""],
+    # ...
+]]
+```
+
+#### Reorganize — all sources (replaces existing labels)
+
+```python
+# Request params — [1] = force full regeneration
+[[2], notebook_id, null, null, [1]]
+
+# Example
+[[2], "180cfc20-9d9f-4ebf-a5d3-1b50d5593b8b", null, null, [1]]
+
+# Response: same structure as auto-label — returns the new label set
+# NOTE: UI shows a confirmation dialog before sending this request
+```
+
+#### Reorganize — unlabeled sources only
+
+```python
+# Request params — [0] = only label sources with no existing label assignment
+[[2], notebook_id, null, null, [0]]
+
+# Example
+[[2], "180cfc20-9d9f-4ebf-a5d3-1b50d5593b8b", null, null, [0]]
+
+# Response: same structure as auto-label — returns the full updated label set
+# NOTE: UI fires this immediately without a confirmation dialog
+```
+
+#### Create a new empty label
+
+```python
+# Request params — note position 5 contains [[label_name, emoji]]
+[[2], notebook_id, null, null, null, [[label_name, ""]]]
+
+# Example: create "My New Label" with no emoji
+[[2], "180cfc20-...", null, null, null, [["My New Label", ""]]]
+
+# Response: same as auto-label — returns full updated label list with new label
+# The new label has null sources and a freshly generated label_id:
+[null, [
+    # ... existing labels ...
+    ["My New Label", null, "a0e1a3d0-bcc4-4619-bcd2-f152c64fe7d8", ""]
+]]
+```
+
+### `le8sX` — Label Mutation (Rename / Set Emoji / Move Source)
+
+This single RPC handles all label content mutations. The 4th parameter determines the operation type.
+
+#### Rename a label
+
+```python
+# Request params
+[[2], notebook_id, label_id, [[[new_name]]]]
+
+# Example: rename to "Enterprise Use Cases"
+[[2], "180cfc20-...", "286c7cc0-...", [[["Enterprise Use Cases"]]]]
+
+# Response: [] (empty = success)
+```
+
+#### Set (or change) an emoji on a label
+
+```python
+# Request params — null name + emoji string at position 1
+[[2], notebook_id, label_id, [[[null, "🏷️"]]]]
+
+# Example
+[[2], "180cfc20-...", "6d7564e6-...", [[[null, "📊"]]]]
+
+# Response: [] (empty = success)
+```
+
+#### Move / assign a source to a label
+
+Adds the source to the target label (multi-label — sources can be in multiple labels).
+
+```python
+# Request params — null at position 0, source_id list at position 1
+[[2], notebook_id, target_label_id, [[null, [[source_id]]]]]
+
+# Example: move source to "Marketing Applications"
+[[2], "180cfc20-...", "6d7564e6-...", [[null, [["845deae5-df8a-4c9a-9d11-53b0761823af"]]]]]
+
+# Response: [] (empty = success)
+```
+
+### `GyzE7e` — Delete Label(s)
+
+Deletes one or more labels. Sources belonging to the deleted labels are NOT deleted.
+If removing a label that contains sources exclusively, reassign them first via `le8sX`.
+
+```python
+# Request params — array of label_ids to delete
+[[2], notebook_id, [label_id, ...]]
+
+# Example: delete one label
+[[2], "180cfc20-...", ["286c7cc0-39f3-4349-940f-ea50e34169eb"]]
+
+# Example: delete multiple labels at once
+[[2], "180cfc20-...", ["label-id-1", "label-id-2"]]
+
+# Response: [] (empty = success)
+```
+
+### `LQhfEb` — Toggle Source Panel View
+
+Saves the user's preference for label view vs flat list view. Not needed for label management itself, but fired when switching between views.
+
+```python
+# Label view (view=1)
+[null, notebook_id, [null, [null, 1]], [["notebook_lm_state.saved_source_panel_view"]]]
+
+# List view (view=2)
+[null, notebook_id, [null, [null, 2]], [["notebook_lm_state.saved_source_panel_view"]]]
+
+# Response: [] (empty = success)
+```
+
+### Remove Label — Two-step Process
+
+The "Remove" operation in the UI (which preserves sources) is a two-step sequence:
+1. `le8sX` — Move any sources that would become orphaned to another label
+2. `GyzE7e` — Delete the now-empty label
+
+```python
+# Step 1: reassign orphaned sources to a different label
+le8sX([[2], notebook_id, target_label_id, [[null, [[orphaned_source_id]]]]])
+
+# Step 2: delete the label
+GyzE7e([[2], notebook_id, [label_id_to_remove]])
+```
+
+---
+
+## User Tier and Usage Limits
+
+### `ozz5Z` — Get User Subscription Tier
+
+Returns the user's current NotebookLM subscription tier. Fires on the homepage (`source-path=/`) during page load.
+
+**Captured request params (2026-04-27, `source-path=/`):**
+```python
+# Inner JSON params sent to the RPC:
+[[[[null, "1", 627], [null,null,null,null,null,null,null,null,null,[null,null,2]], 1]]]
+
+# 627 and "1" appear to be hardcoded NotebookLM product/SKU constants.
+# The same values appear in the support URL: ?ms=pt:1613;s:627
+# path used: source-path=/ (homepage, no notebook context needed)
+```
+
+**Captured response (decoded, 2026-04-27):**
+```python
+# Tier string is at response[0][0][1][0][1][...]["NOTEBOOKLM_TIER_PRO_DASHER_END_USER"]
+# Full decoded structure (abbreviated):
+[[[[null,"1",627],[[1613,[..., "NOTEBOOKLM_TIER_PRO_DASHER_END_USER", ...]], 0]]]]
+
+# Also contains:
+# - "Manage subscription" link
+# - Support URL: https://support.google.com/notebooklm/answer/16213268?ms=pt:1613;s:627;vp:9
+# - Encoded tokens (session context): "CM0MEO4KICso..." and "CAI="
+```
+
+**Known tier strings:**
+| Tier String | Plan |
+|-------------|------|
+| `NOTEBOOKLM_TIER_STANDARD` | Free / Standard |
+| `NOTEBOOKLM_TIER_PLUS` | Google AI Plus |
+| `NOTEBOOKLM_TIER_PRO` | Google AI Pro |
+| `NOTEBOOKLM_TIER_PRO_DASHER_END_USER` | Google Workspace Pro user |
+| `NOTEBOOKLM_TIER_ULTRA` | Google AI Ultra |
+
+**Implementation note:** This RPC is dual-mapped in `core/utils.py` as `add_source_v2`. When called
+with the homepage params above it returns tier info. When called in a notebook context with different
+params it handles the newer source-add flow. Use `source-path=/` and the params above for tier detection.
+
+### `ZwVcOc` — Settings (also fires on homepage)
+
+Also fires on every page load. Returns app settings including what appear to be account-level limits.
+
+**Captured request params (2026-04-27):**
+```python
+[null, [1, null, null, null, null, null, null, null, null, null, [1]]]
+```
+
+**Captured response (decoded, 2026-04-27):**
+```python
+[[null, [6, 500, 300, 500000, 2], [true, null, null, true, ["en", ...], ...], [[1]], [true, 2, 3, 2]]]
+
+# [6, 500, 300, 500000, 2] — second element — suspected to be account limits:
+#   500 = max notebooks (matches Pro tier: 500/user)
+#   300 = max sources per notebook (matches Pro tier: 300/notebook)
+#   6, 500000, 2 — unknown; could be tier code, storage, or other config
+# Not confirmed — needs testing against Standard/Plus/Ultra accounts to validate.
+```
+
+### Usage Limits by Tier (from official docs, subject to change)
+
+| Feature | Standard | Plus | Pro | Ultra |
+|---------|----------|------|-----|-------|
+| Notebooks | 100/user | 200/user | 500/user | 500/user |
+| Sources | 50/notebook | 100/notebook | 300/notebook | 600/notebook |
+| Chats | 50/day | 200/day | 500/day | 5,000/day |
+| Audio Overviews | 3/day | 6/day | 20/day | 200/day |
+| Video Overviews | 3/day | 6/day | 20/day | 200/day |
+| Cinematic Videos | — | — | 2/day | 20/day |
+| Reports | 10/day | 20/day | 100/day | 1,000/day |
+| Flashcards | 10/day | 20/day | 100/day | 1,000/day |
+| Quizzes | 10/day | 20/day | 100/day | 1,000/day |
+| Mind Maps | Unlimited | Unlimited | Unlimited | Unlimited |
+| Deep Research | 10/month | 3/day | 20/day | 200/day |
+| Data Tables | Limited | More | Higher | Highest |
+| Infographics | Limited | More | Higher | Highest |
+| Slide Decks | Limited | More | Higher | Highest |
+
+**Notes:**
+- Daily quotas reset after 24 hours; monthly quotas reset after 30 days
+- Auto-generated artifacts (on first source add) do NOT count toward limits
+- There is no API endpoint to query current usage counts — limits are enforced server-side

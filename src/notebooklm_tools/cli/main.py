@@ -2,6 +2,7 @@
 
 import contextlib
 import logging
+from typing import Any
 
 import typer
 
@@ -14,6 +15,7 @@ from notebooklm_tools.cli.commands.cross import app as cross_app
 from notebooklm_tools.cli.commands.doctor import app as doctor_app
 from notebooklm_tools.cli.commands.download import app as download_app
 from notebooklm_tools.cli.commands.export import app as export_app
+from notebooklm_tools.cli.commands.label import app as label_app
 from notebooklm_tools.cli.commands.note import app as note_app
 from notebooklm_tools.cli.commands.notebook import app as notebook_app
 from notebooklm_tools.cli.commands.pipeline import app as pipeline_app
@@ -86,6 +88,37 @@ profile_app = typer.Typer(
 )
 
 
+def _validate_saved_profile(auth: Any) -> tuple[Any, int]:
+    """Validate saved credentials by making a real NotebookLM API call."""
+    from notebooklm_tools.core.client import NotebookLMClient
+
+    p = auth.load_profile()
+    with NotebookLMClient(
+        cookies=p.cookies,
+        csrf_token=p.csrf_token or "",
+        session_id=p.session_id or "",
+        build_label=p.build_label or "",
+    ) as client:
+        notebooks = client.list_notebooks()
+
+    auth.save_profile(
+        cookies=p.cookies,
+        csrf_token=p.csrf_token,
+        session_id=p.session_id,
+        email=p.email,
+        build_label=p.build_label,
+    )
+    return p, len(notebooks)
+
+
+def _print_auth_valid(profile: Any, notebook_count: int) -> None:
+    console.print("[green]✓[/green] Authentication valid!")
+    console.print(f"  Profile: {profile.name}")
+    console.print(f"  Notebooks found: {notebook_count}")
+    if profile.email:
+        console.print(f"  Account: {profile.email}")
+
+
 @login_app.callback(invoke_without_command=True)
 def login_callback(
     ctx: typer.Context,
@@ -132,6 +165,11 @@ def login_callback(
         "--clear",
         help="Delete the localized Chrome profile data before logging in, to switch Google accounts",
     ),
+    wsl: bool = typer.Option(
+        False,
+        "--wsl",
+        help="Launch Windows Chrome from WSL (fixes terminal corruption on WSL2)",
+    ),
 ) -> None:
     """
     Authenticate with NotebookLM.
@@ -141,6 +179,7 @@ def login_callback(
     Use --check to validate existing credentials.
     Use --provider openclaw --cdp-url <url> to read auth from an existing
     OpenClaw-managed browser CDP endpoint.
+    Use --wsl on WSL2 to launch Windows Chrome and avoid terminal corruption.
 
     To switch active accounts, run `nlm login switch <profile>`.
     """
@@ -169,33 +208,9 @@ def login_callback(
     if check:
         # Check existing auth by making a real API call
         try:
-            from notebooklm_tools.core.client import NotebookLMClient
-
-            p = auth.load_profile()
+            p, notebook_count = _validate_saved_profile(auth)
             console.print(f"[dim]Checking credentials for profile: {p.name}...[/dim]")
-
-            # Actually test the API using profile's credentials
-            with NotebookLMClient(
-                cookies=p.cookies,
-                csrf_token=p.csrf_token or "",
-                session_id=p.session_id or "",
-            ) as client:
-                notebooks = client.list_notebooks()
-
-            # Success! Update last validated
-            auth.save_profile(
-                cookies=p.cookies,
-                csrf_token=p.csrf_token,
-                session_id=p.session_id,
-                email=p.email,
-                build_label=p.build_label,
-            )
-
-            console.print("[green]✓[/green] Authentication valid!")
-            console.print(f"  Profile: {p.name}")
-            console.print(f"  Notebooks found: {len(notebooks)}")
-            if p.email:
-                console.print(f"  Account: {p.email}")
+            _print_auth_valid(p, notebook_count)
         except NLMError as e:
             console.print(f"[red]✗[/red] Authentication failed: {e.message}")
             if e.hint:
@@ -228,18 +243,139 @@ def login_callback(
         console.print("[dim]Supported values: builtin, openclaw[/dim]")
         raise typer.Exit(1)
 
+    if not force:
+        try:
+            p, notebook_count = _validate_saved_profile(auth)
+            _print_auth_valid(p, notebook_count)
+            return
+        except NLMError:
+            pass
+
     try:
         from notebooklm_tools.utils.cdp import (
             extract_cookies_via_cdp,
             extract_cookies_via_existing_cdp,
+            get_browser_display_name,
             terminate_chrome,
         )
 
         launched_local_chrome = False
 
-        if provider == "openclaw":
-            console.print("[bold]Using external CDP authentication provider[/bold]")
-            console.print(f"[dim]Provider: openclaw | CDP: {cdp_url}[/dim]\n")
+        # Default cdp_url for the builtin provider — used to detect when the
+        # user explicitly passes their own --cdp-url value.
+        _BUILTIN_CDP_DEFAULT = "http://127.0.0.1:18800"
+
+        if wsl:
+            # WSL mode: Launch Windows Chrome from WSL to avoid terminal corruption
+            from notebooklm_tools.utils.wsl import (
+                check_firewall_rule,
+                get_windows_host_ip,
+                is_wsl,
+                launch_windows_chrome,
+                terminate_windows_chrome,
+                wait_for_cdp,
+            )
+
+            if not is_wsl():
+                console.print(
+                    "[yellow]Warning:[/yellow] --wsl flag used but not in WSL environment. Ignoring."
+                )
+            else:
+                from notebooklm_tools.utils.wsl import DEFAULT_WSL_CDP_PORT
+
+                wsl_port = DEFAULT_WSL_CDP_PORT
+                # Chrome binds to localhost only (newer Chrome ignores
+                # --remote-debugging-address=0.0.0.0), so we launch it
+                # on a different port and rely on a netsh portproxy rule
+                # (listenport=wsl_port -> connectport=chrome_port) to
+                # bridge WSL traffic to localhost.
+                chrome_port = wsl_port + 1
+                windows_ip = get_windows_host_ip()
+
+                if not windows_ip:
+                    console.print("[red]Error:[/red] Could not determine Windows host IP.")
+                    console.print("[dim]Hint: Check /etc/resolv.conf in WSL[/dim]")
+                    raise typer.Exit(1)
+
+                wsl_cdp_url = f"http://{windows_ip}:{wsl_port}"
+
+                console.print("[bold]WSL2 detected - launching Windows Chrome[/bold]")
+                console.print(
+                    f"[dim]Windows host: {windows_ip}:{wsl_port} (proxy) -> localhost:{chrome_port} (Chrome)[/dim]"
+                )
+                console.print("[dim]Chrome binds to localhost; netsh portproxy bridges WSL[/dim]")
+
+                # Check Windows Firewall
+
+                if not check_firewall_rule(wsl_port):
+                    console.print("\n[yellow]Windows Firewall Setup Required[/yellow]")
+                    console.print(
+                        f"\nA firewall rule is needed to allow WSL to connect to Windows Chrome on port {wsl_port}."
+                    )
+                    console.print(
+                        "\n[bold]Step 1:[/bold] Open [cyan]Windows PowerShell as Administrator[/cyan] and run:"
+                    )
+                    console.print(
+                        f'\n  New-NetFirewallRule -DisplayName "NotebookLM-CDP-{wsl_port}" -Direction Inbound -Action Allow -Protocol TCP -LocalPort {wsl_port} -RemoteAddress LocalSubnet\n'
+                    )
+                    console.print(
+                        "[bold]Step 2:[/bold] After running the command above, press [bold]Enter[/bold] here to continue..."
+                    )
+
+                    # Simple wait for Enter
+                    input()
+
+                    # Re-check if rule was created
+                    if check_firewall_rule(wsl_port):
+                        console.print("[green]✓[/green] Firewall rule detected!")
+                    else:
+                        console.print(
+                            "[yellow]Warning:[/yellow] Rule not yet detected, but will attempt to continue..."
+                        )
+                    console.print()
+                else:
+                    console.print("[dim]Windows Firewall: rule exists[/dim]")
+                console.print()
+
+                try:
+                    chrome_process = launch_windows_chrome(chrome_port)
+                    console.print(f"[dim]Chrome PID: {chrome_process.pid}[/dim]")
+                except RuntimeError as e:
+                    console.print(f"[red]Error:[/red] {e}")
+                    console.print("[dim]Hint: Ensure Chrome is installed on Windows side[/dim]")
+                    raise typer.Exit(1) from e
+
+                console.print("[dim]Waiting for Chrome DevTools Protocol...[/dim]")
+                if not wait_for_cdp(wsl_cdp_url, timeout=30):
+                    console.print("[red]Error:[/red] Chrome did not start within 30 seconds.")
+                    console.print("\n[yellow]Troubleshooting:[/yellow]")
+                    console.print("  1. Ensure the Windows Firewall rule was created (step above)")
+                    console.print("  2. If Chrome is still running, close it and retry")
+                    console.print("  3. Or use manual mode: nlm login --manual --file <path>")
+                    terminate_windows_chrome(chrome_process)
+                    raise typer.Exit(1)
+
+                console.print("[green]✓[/green] Chrome ready, connecting...\n")
+
+                try:
+                    result = extract_cookies_via_existing_cdp(
+                        cdp_url=wsl_cdp_url,
+                        wait_for_login=True,
+                        login_timeout=300,
+                    )
+                finally:
+                    # Always terminate Windows Chrome
+                    terminate_windows_chrome(chrome_process)
+
+                launched_local_chrome = True
+
+        elif provider == "openclaw" or (provider == "builtin" and cdp_url != _BUILTIN_CDP_DEFAULT):
+            # External CDP path: connect to an already-running browser.
+            # Triggered by --provider openclaw OR when the user explicitly
+            # passes a --cdp-url (indicating they have a running Chrome).
+            label = "openclaw" if provider == "openclaw" else "builtin (external CDP)"
+            console.print("[bold]Using external CDP authentication[/bold]")
+            console.print(f"[dim]Provider: {label} | CDP: {cdp_url}[/dim]\n")
 
             result = extract_cookies_via_existing_cdp(
                 cdp_url=cdp_url,
@@ -544,6 +680,7 @@ app.add_typer(login_app, name="login")
 
 # Register noun-first subcommands (existing structure)
 app.add_typer(notebook_app, name="notebook", help="Manage notebooks")
+app.add_typer(label_app, name="label", help="Manage source labels")
 app.add_typer(note_app, name="note", help="Manage notes")
 app.add_typer(source_app, name="source", help="Manage sources")
 app.add_typer(chat_app, name="chat", help="Configure chat settings")
@@ -654,6 +791,10 @@ def cli_main():
     """Main CLI entry point with error handling."""
     import sys
 
+    from notebooklm_tools.utils.io_encoding import configure_stdio_utf8_on_windows
+
+    configure_stdio_utf8_on_windows()
+
     try:
         app()
     except Exception as e:
@@ -682,10 +823,12 @@ def cli_main():
         else:
             raise
     finally:
-        # Check for updates after command execution (runs even on typer.Exit)
-        from notebooklm_tools.cli.utils import print_update_notification
+        try:
+            from notebooklm_tools.cli.utils import print_update_notification
 
-        print_update_notification()
+            print_update_notification()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
