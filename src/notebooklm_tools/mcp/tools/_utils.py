@@ -161,6 +161,10 @@ def logged_tool() -> Callable[[Callable[P, Any]], Callable[P, Any]]:
     immediately when decorated. Supports both synchronous and asynchronous
     functions.
     """
+    from notebooklm_tools.mcp.allowlist import (
+        check_kwargs as _allowlist_check,
+        filter_notebook_list_result as _allowlist_filter,
+    )
 
     def decorator(func: Callable[P, R]) -> Callable[P, R]:
         is_async = inspect.iscoroutinefunction(func)
@@ -175,7 +179,19 @@ def logged_tool() -> Callable[[Callable[P, Any]], Callable[P, Any]]:
                     params = _sanitize_params({k: v for k, v in kwargs.items() if v is not None})
                     mcp_logger.debug(f"MCP Request: {tool_name}({json.dumps(params, default=str)})")
 
+                denied = _allowlist_check(kwargs)
+                if denied is not None:
+                    mcp_logger.info(
+                        "MCP allowlist deny: tool=%s arg=%s",
+                        tool_name,
+                        kwargs.get("notebook_id") or kwargs.get("notebook_ids"),
+                    )
+                    return denied
+
                 result: Any = await async_func(*args, **kwargs)
+
+                if tool_name == "notebook_list":
+                    result = _allowlist_filter(result)
 
                 if mcp_logger.isEnabledFor(logging.DEBUG):
                     result_str = json.dumps(result, default=str)
@@ -196,7 +212,19 @@ def logged_tool() -> Callable[[Callable[P, Any]], Callable[P, Any]]:
                     params = _sanitize_params({k: v for k, v in kwargs.items() if v is not None})
                     mcp_logger.debug(f"MCP Request: {tool_name}({json.dumps(params, default=str)})")
 
+                denied = _allowlist_check(kwargs)
+                if denied is not None:
+                    mcp_logger.info(
+                        "MCP allowlist deny: tool=%s arg=%s",
+                        tool_name,
+                        kwargs.get("notebook_id") or kwargs.get("notebook_ids"),
+                    )
+                    return denied
+
                 result: R = sync_func(*args, **kwargs)
+
+                if tool_name == "notebook_list":
+                    result = _allowlist_filter(result)
 
                 if mcp_logger.isEnabledFor(logging.DEBUG):
                     result_str = json.dumps(result, default=str)

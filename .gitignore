@@ -93,3 +93,6 @@ docs/superpowers/
 
 # uv lockfile (library, not app)
 uv.lock
+
+# Dual graph working directory
+.dual-graph/
