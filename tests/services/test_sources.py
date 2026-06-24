@@ -198,6 +198,35 @@ class TestAddSource:
         # caller's intended title.
         assert result["title"] == "doc.pdf"
 
+    def test_add_file_source_preserves_path_failure_details(self, mock_client, tmp_path):
+        requested_path = tmp_path / "missing.pdf"
+        resolved_path = requested_path.resolve()
+        mock_client.add_file.side_effect = FileNotFoundError(f"File not found: {resolved_path}")
+
+        with pytest.raises(ServiceError) as exc_info:
+            add_source(
+                mock_client,
+                "nb-1",
+                "file",
+                file_path=str(requested_path),
+            )
+
+        error = exc_info.value
+        assert error.user_message == f"Could not add file source: File not found: {resolved_path}"
+        assert error.hint is not None
+        assert "machine running nlm or the MCP server" in error.hint
+        assert str(requested_path) in error.hint
+
+    def test_add_file_source_error_does_not_resolve_path_again(self, mock_client):
+        requested_path = "~missing-user/document.pdf"
+        mock_client.add_file.side_effect = RuntimeError("upload failed")
+
+        with pytest.raises(ServiceError) as exc_info:
+            add_source(mock_client, "nb-1", "file", file_path=requested_path)
+
+        assert exc_info.value.user_message == "Could not add file source: upload failed"
+        assert requested_path in (exc_info.value.hint or "")
+
     def test_invalid_source_type(self, mock_client):
         with pytest.raises(ValidationError, match="Unknown source type"):
             add_source(mock_client, "nb-1", "podcast")
@@ -258,10 +287,95 @@ class TestListDriveSources:
         assert result["stale_count"] == 0
         assert result["drive_sources"][0]["stale"] is False
 
+    def test_skip_freshness_does_not_check_sources(self, mock_client):
+        result = list_drive_sources(mock_client, "nb-1", skip_freshness=True)
+        assert result["drive_count"] == 1
+        assert result["drive_sources"][0]["stale"] is None
+        assert result["stale_count"] == 0
+        mock_client.check_source_freshness.assert_not_called()
+
     def test_api_error(self, mock_client):
         mock_client.get_notebook_sources_with_types.side_effect = RuntimeError("fail")
         with pytest.raises(ServiceError, match="Failed to list"):
             list_drive_sources(mock_client, "nb-1")
+
+    def test_50_drive_sources_complete_under_2s(self, mock_client):
+        """50 Drive sources should complete well under 2s thanks to parallel
+        freshness checks. The mock simulates 100ms of RPC latency per call
+        (faster than the real ~660ms median from the probe) so a sequential
+        implementation would take ~5s, well over the 2s budget. A parallel-8
+        implementation takes ~700ms.
+        """
+        import time
+        from unittest.mock import patch
+
+        sources = [
+            {
+                "id": f"s{i}",
+                "title": f"Drive {i}",
+                "source_type_name": "Drive",
+                "can_sync": True,
+                "drive_doc_id": f"d{i}",
+            }
+            for i in range(50)
+        ]
+        mock_client.get_notebook_sources_with_types.return_value = sources
+
+        def fake_check(_source_id):
+            import time as _t
+
+            _t.sleep(0.1)  # 100ms simulated RPC
+            return True
+
+        patched = patch.object(mock_client, "check_source_freshness", side_effect=fake_check)
+        with patched as mock_check:
+            start = time.perf_counter()
+            result = list_drive_sources(mock_client, "nb-1")
+            elapsed = time.perf_counter() - start
+
+        assert result["drive_count"] == 50
+        assert mock_check.call_count == 50
+        assert elapsed < 2.0, f"took {elapsed:.2f}s, expected <2s (sequential would be ~5s)"
+
+    def test_per_source_error_does_not_fail_others(self, mock_client):
+        """If check_source_freshness raises for one source, that source gets
+        stale=None and the rest still resolve normally.
+        """
+        sources = [
+            {
+                "id": "good1",
+                "title": "Good 1",
+                "source_type_name": "Drive",
+                "can_sync": True,
+                "drive_doc_id": "d1",
+            },
+            {
+                "id": "bad1",
+                "title": "Bad",
+                "source_type_name": "Drive",
+                "can_sync": True,
+                "drive_doc_id": "d2",
+            },
+            {
+                "id": "good2",
+                "title": "Good 2",
+                "source_type_name": "Drive",
+                "can_sync": True,
+                "drive_doc_id": "d3",
+            },
+        ]
+        mock_client.get_notebook_sources_with_types.return_value = sources
+        mock_client.check_source_freshness.side_effect = [True, RuntimeError("rpc fail"), False]
+
+        result = list_drive_sources(mock_client, "nb-1")
+
+        assert result["drive_count"] == 3
+        by_id = {s["id"]: s for s in result["drive_sources"]}
+        assert by_id["good1"]["stale"] is False
+        assert by_id["bad1"]["stale"] is None  # errored → unknown
+        assert by_id["good2"]["stale"] is True
+        # stale_count only counts definitive stale=True/False, not None
+        assert result["stale_count"] == 1
 
 
 class TestSyncDriveSources:

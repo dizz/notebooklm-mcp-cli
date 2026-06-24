@@ -2,6 +2,11 @@
 
 This guide explains how to authenticate with NotebookLM MCP and CLI.
 
+> For public HTTP deployment or Claude web/mobile connectors, see
+> [Remote MCP Deployment](REMOTE_MCP.md). Remote use introduces a separate MCP
+> endpoint authentication requirement in addition to the Google browser session
+> described here.
+
 ## Overview
 
 NotebookLM uses browser cookies for authentication (there is no official API). The CLI/MCP extracts these cookies automatically from a managed browser session:
@@ -264,6 +269,33 @@ Then restart your AI assistant.
 - **Session ID:** Auto-refreshed on each MCP client initialization
 
 When you start seeing authentication errors, simply run `nlm login` again to refresh.
+
+---
+
+## Understanding `auth_status`
+
+The MCP `server_info` tool and `nlm login --check` report one of five
+`auth_status` values from the multi-probe AuthHealthChecker. Knowing the
+difference matters: a `stale` status means you must re-auth, but
+an `unverified` status is a network problem, not a credential problem.
+
+> **Caching note:** the `server_info` result is cached for 30 seconds
+> (the checker's `CACHE_TTL`) and bypassed on the next call if any auth
+> file on disk is rewritten, so an external `nlm login` is reflected
+> without waiting for the TTL. `nlm login --check` is always live.
+
+| Status | Meaning | What to do |
+|--------|---------|------------|
+| `configured` | Live check passed. Credentials are good. | Nothing. |
+| `not_configured` | No credentials are stored at all (first-time setup). | Run `nlm login`. |
+| `stale` | Credentials are known-bad: the live check was redirected to `accounts.google.com` (cookies expired), the on-disk profile failed to load, or the last successful validation is older than 7 days. | Run `nlm login` to refresh. Subsequent API calls will fail. |
+| `unverified` | The live check could not be completed (network timeout, DNS failure, proxy block, non-200 HTTP). Cached credentials on disk are still intact and may work for actual API calls. | Retry later, or check your network/proxy. Do not assume the user needs to re-auth — operations often still succeed. |
+| `error` | Unexpected exception inside the check itself (very rare). | File a bug with the traceback. |
+
+> **Heads up for AI agents:** If you see `auth_status = "stale"`, prompt the
+> user to re-authenticate. If you see `auth_status = "unverified"` while
+> recent operations are succeeding, treat it as a transient monitoring
+> failure and continue — re-auth is not required.
 
 ---
 

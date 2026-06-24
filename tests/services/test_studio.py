@@ -5,7 +5,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from notebooklm_tools.core.errors import ResourceExhaustedError, RPCError
+from notebooklm_tools.core.errors import ResourceExhaustedError, RPCDriftError, RPCError
 from notebooklm_tools.services.errors import ServiceError, ValidationError
 from notebooklm_tools.services.studio import (
     VALID_ARTIFACT_TYPES,
@@ -225,6 +225,14 @@ class TestCreateArtifact:
         assert "SomeErrorDetail" in err.user_message
         assert "code 7" in err.user_message
 
+    def test_drift_error_propagates_verbatim(self, mock_client):
+        """RPCDriftError must be wrapped in ServiceError but preserve its message."""
+        mock_client.create_infographic.side_effect = RPCDriftError("izAoDd", ["wXbhsf", "ozz5Z"])
+        with pytest.raises(ServiceError) as exc_info:
+            create_artifact(mock_client, "nb-1", "infographic")
+        assert "izAoDd" in exc_info.value.user_message
+        assert "NOTEBOOKLM_RPC_OVERRIDES" in exc_info.value.user_message
+
 
 class TestNormalizeVideoStyle:
     """Test video style normalization rules."""
@@ -378,6 +386,18 @@ class TestReviseArtifact:
         assert "editable notebook you own" in err.hint
         assert "view-only/shared decks" in err.hint
 
+    def test_drift_error_propagates_verbatim(self, mock_client):
+        """RPCDriftError must be wrapped in ServiceError but preserve its message."""
+        mock_client.revise_slide_deck.side_effect = RPCDriftError("KmcKPe", ["rc3d8d"])
+        with pytest.raises(ServiceError) as exc_info:
+            revise_artifact(
+                mock_client,
+                "art-123",
+                [{"slide": 1, "instruction": "Tighten the title"}],
+            )
+        assert "KmcKPe" in exc_info.value.user_message
+        assert "NOTEBOOKLM_RPC_OVERRIDES" in exc_info.value.user_message
+
     def test_rpc_error_without_detail_type_preserves_original_message(self, mock_client):
         mock_client.revise_slide_deck.side_effect = RPCError(
             "API error (code 7): PERMISSION_DENIED",
@@ -458,3 +478,26 @@ class TestDeleteArtifact:
         mock_client.delete_studio_artifact.side_effect = RuntimeError("fail")
         with pytest.raises(ServiceError, match="Failed to delete"):
             delete_artifact(mock_client, "art-1", "nb-1")
+
+
+class TestStudioStatusSourceIds:
+    """get_studio_status surfaces per-artifact source_ids from the client."""
+
+    def test_source_ids_propagate_to_artifact_info(self, mock_client):
+        mock_client.poll_studio_status.return_value = [
+            {
+                "artifact_id": "a1",
+                "type": "audio",
+                "status": "completed",
+                "source_ids": ["uuid-aaa", "uuid-bbb"],
+            },
+        ]
+        result = get_studio_status(mock_client, "nb-1")
+        assert result["artifacts"][0]["source_ids"] == ["uuid-aaa", "uuid-bbb"]
+
+    def test_source_ids_default_empty_when_absent(self, mock_client):
+        mock_client.poll_studio_status.return_value = [
+            {"artifact_id": "a1", "type": "report", "status": "completed"},
+        ]
+        result = get_studio_status(mock_client, "nb-1")
+        assert result["artifacts"][0]["source_ids"] == []

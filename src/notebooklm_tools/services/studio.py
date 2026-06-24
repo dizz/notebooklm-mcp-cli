@@ -16,7 +16,7 @@ from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
 from notebooklm_tools.core import constants
-from notebooklm_tools.core.errors import ResourceExhaustedError, RPCError
+from notebooklm_tools.core.errors import ResourceExhaustedError, RPCDriftError, RPCError
 
 from ._compat import TypedDict
 from .errors import ServiceError, ValidationError
@@ -78,10 +78,12 @@ class ArtifactInfo(TypedDict, total=False):
     type: str
     title: str
     status: str
+    error_reason: str | None
     created_at: str | None
     url: str | None
     custom_instructions: str | None
     visual_style_prompt: str | None
+    source_ids: list[str]
     audio_url: str | None
     video_url: str | None
     infographic_url: str | None
@@ -374,6 +376,9 @@ def create_artifact(
             f"Failed to create {artifact_type}: {formatted_error}",
             user_message=f"Could not create {artifact_type.replace('_', ' ')} — {formatted_error}.",
         ) from e
+    except RPCDriftError as e:
+        # Let the actionable NOTEBOOKLM_RPC_OVERRIDES guidance reach the user verbatim.
+        raise ServiceError(message=str(e), user_message=str(e)) from e
     except Exception as e:
         logger.error("Studio create failed: %s: %s", type(e).__name__, e, exc_info=True)
         raise ServiceError(
@@ -566,6 +571,31 @@ def _create_mind_map(
 # ---------- Status ----------
 
 
+def _derive_error_reason(raw_artifact: dict[str, Any]) -> str | None:
+    """Best-effort failure reason for a studio artifact.
+
+    The raw NotebookLM gRPC payload does not include an error string, so:
+    1. Prefer a real key if a future API version provides one.
+    2. Otherwise, synthesize a reason for genuinely failed artifacts so callers
+       get a non-null signal instead of silence (the bug: failed artifacts
+       returned every field null, leaving agents to poll forever).
+    Non-failed artifacts return None.
+    """
+    for key in ("error_reason", "failure_reason", "failure_code", "error"):
+        value = raw_artifact.get(key)
+        if isinstance(value, str) and value:
+            return value
+
+    if raw_artifact.get("status") == "failed":
+        return (
+            "generation_failed: NotebookLM rejected or aborted this artifact "
+            "(no media produced). Common causes: expired auth, capacity/"
+            "rate-limit, or an unsupported prompt. Re-check auth (nlm login) "
+            "and retry."
+        )
+    return None
+
+
 def get_studio_status(
     client: NotebookLMClient,
     notebook_id: str,
@@ -598,6 +628,11 @@ def get_studio_status(
             "status": raw_artifact.get("status")
             if isinstance(raw_artifact.get("status"), str)
             else "unknown",
+            # Surface a failure signal so callers stop polling and act. The raw
+            # gRPC payload carries no error string, so prefer any real key if a
+            # future API exposes one, else synthesize a reason for failed
+            # artifacts (status 4 with no media URL = backend rejected the job).
+            "error_reason": _derive_error_reason(raw_artifact),
             "created_at": raw_artifact.get("created_at")
             if isinstance(raw_artifact.get("created_at"), str)
             or raw_artifact.get("created_at") is None
@@ -638,6 +673,9 @@ def get_studio_status(
             if isinstance(raw_artifact.get("duration_seconds"), int)
             or raw_artifact.get("duration_seconds") is None
             else None,
+            "source_ids": [
+                sid for sid in (raw_artifact.get("source_ids") or []) if isinstance(sid, str)
+            ],
         }
         artifact_id = raw_artifact.get("artifact_id")
         if isinstance(artifact_id, str):
@@ -820,6 +858,9 @@ def revise_artifact(
             user_message=f"Failed to revise slide deck — {formatted_error}.",
             hint=hint,
         ) from e
+    except RPCDriftError as e:
+        # Let the actionable NOTEBOOKLM_RPC_OVERRIDES guidance reach the user verbatim.
+        raise ServiceError(message=str(e), user_message=str(e)) from e
     except Exception as e:
         raise ServiceError(
             f"Failed to revise slide deck: {e}",

@@ -53,7 +53,8 @@ Consolidated tools:
 - studio_create(artifact_type=audio|video|...): Create any artifact type
 - studio_revise: Revise individual slides in an existing slide deck
 - download_artifact(artifact_type=audio|video|...): Download any artifact type
-- note_create/note_list/note_update/note_delete: Manage notes in notebooks""",
+- note(action=create|list|update|delete): Manage notes in notebooks
+- label(action=auto|list|reorganize|create|rename|set_emoji|move_source|delete): Manage source labels""",
 )
 
 # MCP request/response logger
@@ -223,7 +224,13 @@ Examples:
         "--stateless",
         action=argparse.BooleanOptionalAction,
         default=_env_bool("NOTEBOOKLM_MCP_STATELESS", default=True),
-        help="Stateless HTTP sessions (default: true). Avoids MCP SDK double-response crash (python-sdk#2416)",
+        help=(
+            "Stateless HTTP sessions (default: true). Avoids MCP SDK double-response crash "
+            "(python-sdk#2416). NOTE: this affects the MCP HTTP transport layer only — "
+            "it does NOT control the in-process conversation history cache. To bound the "
+            "conversation cache (e.g. for long-lived servers), set "
+            "NOTEBOOKLM_CONVERSATION_MAX_TURNS / NOTEBOOKLM_CONVERSATION_MAX_CONVS."
+        ),
     )
     parser.add_argument(
         "--debug",

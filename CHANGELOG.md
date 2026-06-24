@@ -5,6 +5,157 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.7.8] - 2026-06-20
+
+### Added
+
+- **Studio artifact source provenance (PR #240)** — `studio_status` and `nlm studio status --json --full` now include each artifact's `source_ids`, allowing callers to trace generated podcasts, videos, reports, slide decks, infographics, quizzes, flashcards, and data tables back to their source documents. The parser handles the nested source-ID shapes returned by current NotebookLM responses. Thanks to **@tonhuu96** for identifying the missing capability and contributing the end-to-end implementation!
+
+### Fixed
+
+- **Actionable file-source upload errors** — File upload failures now preserve the concrete reason and received path instead of returning only `Could not add file source.` The hint clarifies that paths must be accessible on the machine running `nlm` or the MCP server, which makes different-host and remote MCP failures diagnosable.
+
+### Documentation
+
+- **Regional audio accent locales** — Documented the observed BCP-47 region behavior for Audio Overviews: `es`/`es-ES` selects Spain Spanish, while `es-US`/`es-419` selects Latin-American Spanish. The same regional locale can be supplied through `NOTEBOOKLM_HL`.
+- **Packaged skill capability audit** — Brought the installable NotebookLM skill and references in sync with the current 39-tool MCP surface and CLI. Updated authentication semantics, async query tools, research auto-import and 15-minute polling, labels, bulk source and sharing operations, artifact source provenance, server-local file paths, remote MCP security, RPC drift recovery, current command syntax, pipeline/batch examples, and consolidated tool contracts.
+
+## [0.7.7] - 2026-06-19
+
+### Fixed
+
+- **SOCKS proxy environments failed during HTTP client initialization (Fixes #237)** — The package now installs HTTPX with its SOCKS transport dependency. Environments that provide outbound access through `ALL_PROXY=socks5://...` or `socks5h://...` no longer fail with a missing `socksio` import before the first request. Sync and async client initialization are covered by regression tests and were verified through a live SOCKS5 proxy.
+
+### Documentation
+
+- **Remote MCP deployment guide (Issue #238)** — Added a dedicated guide explaining Claude web/mobile connector requirements, the separate MCP and Google authentication layers, external-bind security, single-account behavior, remote file limitations, supported deployment boundaries, and Claude Code Remote Control as the recommended mobile-access alternative.
+
+## [0.7.6] - 2026-06-16
+
+### Added
+
+- **Skip Drive freshness checks for large notebooks** — `source_list_drive` now accepts `skip_freshness=True`, and `nlm source list <notebook-id> --drive --skip-freshness` returns the source list without making one freshness API call per Drive source. This gives users with very large notebooks a fast listing path when freshness status is not needed. Skipped freshness is reported as unknown (`stale: null` / `is_stale: null`), not fresh.
+
+### Changed
+
+- **Release publish workflow now gates PyPI publishing** — The publish workflow now runs version alignment, ruff lint/format checks, and the non-E2E pytest suite before building and publishing. This catches release-blocking failures inside the publishing workflow before uploading to PyPI.
+
+## [0.7.5] - 2026-06-15
+
+### Fixed
+
+- **Layering violation on RPCDriftError** — The `RPCDriftError` was bypassing the service layer error wrapping, exposing raw exception types instead of the friendly `ServiceError` payload. It is now correctly wrapped while perfectly preserving the actionable `NOTEBOOKLM_RPC_OVERRIDES` hot-patch instructions for the user.
+
+### Community
+
+- **Version alignment & PR #233 follow-ups (PR #235)** — Brought version strings back into alignment and silenced a noisy RPC override warning in the logs by dropping it to `INFO` level. Thanks to **@Grobiou** for the cleanups!
+
+## [0.7.4] - 2026-06-15
+
+### Added
+
+- **`research_status`: `auto_import` parameter** — Pass `auto_import=True` and the tool automatically imports discovered sources on completion. No separate `research_import` call needed. When `False` (default), the response includes a `next_action` hint pointing you to the exact `research_import` call to make. Fixes the empty-notebook-shell problem reported in #231.
+
+### Fixed
+
+- **`source_list_drive` timeouts on large notebooks (Fixes #232)** — Drive-source freshness checks were made one at a time, in sequence. A notebook with 50 Drive sources took ~30 seconds and routinely hit the 30-second timeout. Freshness checks now run in parallel (8 workers). Measured on a live 44-source notebook: 29s sequential → 3.1s parallel, zero rate-limit errors. If one source's freshness check fails, that source reports `stale: null` instead of failing the whole list.
+- **`research_status` default timeout too short for deep research** — The MCP default was 5 minutes; deep research frequently runs longer. Default `max_wait` bumped to 15 minutes (900s), poll interval stays 30s. The CLI `--auto-import` flow is now consistent: same 15-minute / 30-second cadence instead of the old mode-specific 10-minute / 10-second split.
+- **RPC drift detection silent on empty responses (PR #233, follow-up)** — The `RPCDriftError` doc said "instead of returning silently" but the code still returned `None` silently when the response had no `wrb.fr` chunks to compare against. Clarified the behavior in `CLAUDE.md` and added the MCP server restart requirement to the `NOTEBOOKLM_RPC_OVERRIDES` hot-patch instructions.
+
+### Community
+
+- **RPC resilience (PR #233)** — Runtime RPC-ID overrides via `NOTEBOOKLM_RPC_OVERRIDES`, loud `RPCDriftError` on rotation detection, and exponential-backoff retry for `RESOURCE_EXHAUSTED` (code 8) throttling. Thanks to **@Grobiou** for the contribution!
+
+## [0.7.3] - 2026-06-09
+
+### Added
+
+- **Scripting & Automation section in CLI_GUIDE.md (PR #226)** — Documents how to reliably parse `--json` output in automation scripts using a JSON parser rather than string splitting. Thanks to **@JanaGK2** for the first contribution!
+
+### Fixed
+
+- **Reverted ChatGPT file bridge (PR #220)** — The ChatGPT file upload/download bridge introduced an SSRF vulnerability (no hostname validation on downloaded URLs), a disk leak (every `source_get_content` call wrote files to disk with no cleanup), and unintended behavioral changes to `source_get_content` and `download_artifact` for all users. The feature has been reverted. A future release will re-introduce the polling improvements (`wait`/`poll_interval`) cleanly, and the ChatGPT integration may return in a hardened form.
+- **Tightened `no_proxy` sanitization** — The v0.7.2 sanitizer stripped all `no_proxy` entries containing `:`, incorrectly removing legitimate IPv6 loopback addresses (`::1`) and `host:port` entries. The fix now targets only CIDR-style IPv6 entries (e.g., `fe11::/16`) that crash httpx's URL parser, preserving all other valid entries.
+
+## [0.7.2] - 2026-06-08
+
+### Fixed
+
+- **Modern Chrome Cookie DB path detection (PR #222)** — Improved the SQLite cookie database location search logic for Google Chrome to work correctly with modern Chrome setups. Thanks to **@insane66613**!
+- **Profile-aware headless refresh (PR #223)** — Fixed headless login refresh to use the default/active profile configured in the CLI configuration file instead of falling back. Thanks to **@insane66613**!
+- **`AuthHealthChecker` API fallback passed wrong cookie format, causing false `stale` on semi-stale sessions (PR #225)** — The API fallback flattened `profile.cookies` to a dict, dropping domain-specific duplicates and omitting `session_id` / `build_label`. The API probe now passes `profile.cookies` unchanged with all session fields, matching `nlm login --check`. Thanks to **@insane66613**!
+- **`server_info`, `refresh_auth`, and `studio_create` disagreed on semi-stale auth (PR #225, Fixes #224)** — These three MCP paths each ran independent auth checks, so `server_info` could report `stale` and `studio_create` refuse to run while `notebook_list` and CLI tools worked fine. All MCP auth gates now share `credentials_are_usable()` (`AuthHealthChecker` + live API confirmation), eliminating split-brain results. Thanks to **@insane66613**!
+- **Sanitize `no_proxy` environment variable (PR #221)** — Fixed package import crashes on Windows systems caused by CIDR-style IPv6 entries in `no_proxy` that httpx cannot parse. Thanks to **@insane66613**!
+
+## [0.7.1] - 2026-06-06
+
+### Fixed
+
+- **`server_info` reported `"stale"` for valid semi-stale cookies (PR #219)** — Google enforces different session lifecycles for the NotebookLM homepage (a navigation endpoint) and the RPC API endpoints. Cookies that are "semi-stale" — rejected by the homepage with a redirect to `accounts.google.com`, but still 100% accepted by the RPC API — were causing the MCP `server_info` tool (and `nlm login --check`) to falsely report `"stale"` even though every actual API tool would work fine. The new `AuthHealthChecker` runs a homepage probe first and, on `expired` / `http_401` / `http_403`, falls back to a live `NotebookLMClient.list_notebooks()` call before deciding. The homepage headers were also upgraded to use the full browser-like `_PAGE_FETCH_HEADERS` (including `Sec-Fetch-Dest` / `Sec-Fetch-Mode` / `Sec-Fetch-Site` / `Sec-Fetch-User`) — without them Google was bot-detecting the homepage check and redirecting even fresh cookies, producing false `"stale"` reports on first probe. Results are cached for 30 seconds with mtime-based bypass, so an external `nlm login` is reflected without waiting for the TTL. The CLI and MCP now share the cache via the `get_auth_health_checker()` singleton in `services/auth.py`. Thanks to **@SERDAR-AKIN** for the original multi-probe design and PR #219!
+
+### Changed
+
+- **`AuthHealthChecker` lives in `services/auth.py`, not `core/auth.py`** — the multi-probe orchestration, 30-second cache, and verdict aggregation are business logic and belong in the services layer per the layering rule in `CLAUDE.md` / `AGENTS.md` / `GEMINI.md`. `core/auth.py` stays focused on the low-level auth primitives (`AuthManager`, `AuthTokens`, `check_auth`, `save_tokens_to_cache`, `load_cached_tokens`, `_fetch_notebooklm_homepage`).
+- **`server_info` docstring no longer calls `auth_status` a "live check"** — it is cached for 30 seconds with mtime-based bypass. `docs/AUTHENTICATION.md` documents the same contract for `nlm login --check` (always live) vs `server_info` (cached).
+- **`AuthHealthReport.valid` is now `verdict == "configured"` (was `!=`)** — the field was inverted: it returned `True` for `stale` / `unverified` / `not_configured` reports. Pinned by `TestReportValid` in `tests/services/test_auth_health.py`.
+- **API-probe exceptions are classified as transport errors when they are** — `_probe_api` now catches `httpx.TimeoutException` and `httpx.RequestError` explicitly and emits the `"network_error:"` prefix so `_determine_verdict` can route them to `"unverified"`. Previously all exceptions emitted `f"{type(e).__name__}: {e}"`, which meant a real transport error on the API path was misclassified as an auth failure (`"stale"`). Pinned by `TestProbeApiErrorClassification` in `tests/services/test_auth_health.py`.
+
+## [0.7.0] - 2026-06-03
+
+### Added
+
+- **Studio prompting guide and fast-track agent behavior** — AI agents using the MCP skill now follow a fast-track prompting model: infer format, style, and prompt from context, emit a one-line notice, and generate immediately — no multi-question intake questionnaires. A guided preview mode (show settings + full prompt before generating) kicks in only for vague requests, high-stakes content (e.g. cinematic video), or when the user explicitly asks. Two new reference documents ship with the skill: `references/studio-prompting-guide.md` (per-artifact decision trees, prompt parameters) and `references/studio-prompt-examples.md` (copy-paste templates). SKILL.md and `workflows.md` updated throughout.
+- **Cinematic video format** — `video_format=cinematic` is now documented and supported in the skill, CLI, and MCP guide. Cinematic videos take the full creative brief via `focus_prompt` / `--focus`; `--style` is not applicable.
+
+### Fixed
+
+- **Query returns thinking step instead of short answer (Issue #214)** — When the AI's final answer was under 20 characters, for example `ANSWER: C` from a multiple-choice prompt, `nlm` discarded it and returned the longest thinking chunk instead. The 20-char guard in `_extract_answer_from_chunk` (both the list-form and string-form branches) was redundant with the existing type indicator at `first_elem[4][-1]` (1 = answer, 2 = thinking), which is the authoritative discriminator. Removed both guards. The type indicator still routes short thinking chunks to the thinking bucket, so behavior for normal answers is unchanged. 4 new regression tests in `TestShortAnswerRegression` cover: short answer wins over a longer thinking chunk, single-character answers, short thinking chunks still filtered as thinking, and the string-form first_elem path.
+- **`nlm notebook create` missing `--json` (Issue #215)** — Every other notebook verb (`list`, `get`, `describe`, `query`) already supported `--json`, but `create` did not. This was a real friction point for agent workflows that need to capture the new notebook ID reliably. Added the flag; the output is the same `notebook_id` / `title` / `url` / `message` dict that other verbs return, so scripting just works. Thanks to **@SimonMallas** for the report and end-to-end test in the issue!
+- **`auth_status = "stale"` was misleading (Issue #215)** — The MCP `server_info` tool (and `nlm login --check`) reported `"stale"` for any non-`configured` / non-`not_configured` outcome, which silently grouped three very different conditions together: (a) credentials are actually expired and operations will fail, (b) the live check hit a network error/timeout/non-200 and cached creds may still work, and (c) the saved profile failed to load. The new state machine splits this into two distinct values: `"stale"` is reserved for cases (a) and (c) where the user genuinely needs to `nlm login`, and a new `"unverified"` reports case (b) so agents don't pester users to re-auth on transient network blips. Unknown future reasons stay conservative (`"stale"`). No raw `AuthCheckResult.reason` strings are exposed; only the 5 stable status values. The new `Understanding auth_status` section in `docs/AUTHENTICATION.md` documents each state and what to do.
+- **`format_item` silently discarded plain-dict results** — All three formatter classes (`TableFormatter`, `JsonFormatter`, `CompactFormatter`) checked for `model_dump` / `__dict__` before `isinstance(item, dict)`. Because `TypedDict` instances are plain `dict` at runtime (no `model_dump`, no per-instance `__dict__` in CPython), they fell through to the worst-case path: `JsonFormatter` wrapped the payload as `{"value": {...}}` instead of printing it flat, and `CompactFormatter` emitted `str(item)` (the raw dict repr) instead of the notebook ID. Fixed by adding `isinstance(item, dict)` as the first branch in all three `format_item` methods. `nlm notebook create --json` and pipe capture now work correctly.
+- **HTTP 401/403 misclassified as `"unverified"` in `server_info`** — The `reason.startswith("http_")` catch-all in `_check_auth_status` mapped every non-200 response — including definitive credential-rejection codes 401 and 403 — to `"unverified"` ("cached credentials may still work, do not prompt re-auth"). Added explicit `http_401` / `http_403` → `"stale"` guards before the general `http_` branch so agents correctly prompt re-authentication when cookies are genuinely rejected by NotebookLM.
+
+### Documentation
+
+- **New `docs/GETTING_STARTED.md` guide** — First-time setup, agent registration, and a full 5-step migration path from a browser-automation–based NotebookLM MCP (the kind of setup reported in Issue #215). The migration section explicitly calls out removing any legacy `notebooklm` server config as the #1 cause of "Hermes picked the wrong tool" symptoms. README is no longer carrying the migration content; the docs index now points at the new guide. (Issue #215, items 3 and 5)
+- **`MCP_GUIDE.md` server-naming note** — Recommends the default `notebooklm-mcp` server name and warns against generic names that collide with legacy MCPs. (Issue #215, item 5)
+
+## [0.6.15] - 2026-06-01
+
+### Fixed
+
+- **Auth-guard stale-TTL window when tokens change on disk during the cached period** — The 60s auth-guard introduced in 0.6.14 cached the "auth is valid" result for 60s. If you ran `nlm login` (or any flow that rewrote the auth file) during that window, the guard would still report valid and your server would use the stale tokens until the TTL elapsed. Fixed by `services.auth.get_active_auth_mtime()`: the guard now records the latest mtime of the active auth storage (the legacy `auth.json` plus every `cookies.json` under `profiles/`) and invalidates the cache when any of them changes. A write to ANY profile's file invalidates the guard, regardless of which profile the CLI/MCP session is using. 5 new tests cover modern profile layout, legacy fallback, mid-migration (both files exist), fresh install (no files), and config-error defensiveness.
+
+- **Auth-guard mtime check was watching the wrong file (caught by live testing)** — The first iteration of the mtime fix only watched the config's `default_profile`'s `cookies.json`. But the active profile for a CLI/MCP session can be overridden with `--profile`, while the config-level `default_profile` stays put. If you ran `nlm login --profile <other>` externally, the active profile's `cookies.json` would be rewritten but the guard never saw it. The fix above resolves this by globbing all `profiles/*/cookies.json` files. Live testing against a real Chrome login + real NotebookLM API confirmed the fix.
+
+### Changed
+
+- **`services/auth.py` is now a full shim, not a single-symbol re-export** — The 0.6.14 release added `services/auth.py` to route `check_auth` through the services layer. This release extends it to cover all 6 auth symbols that the cli/ and mcp/ layers were importing directly from `core/`: `check_auth`, `load_cached_tokens`, `save_tokens_to_cache`, `get_cache_path`, `validate_cookies`, plus the two class symbols `AuthTokens` and `AuthManager` via PEP 562 `__getattr__`. The shim is a thin layer with no business logic of its own; behavior is unchanged. The only remaining direct `core.auth` import in cli/ or mcp/ is in `utils/cdp.py`, which has a circular-import guard and is explicitly outside the layering rule's scope.
+
+## [0.6.14] - 2026-06-01
+
+### Fixed
+
+- **`nlm login` crash on fully expired auth (PR #211 / Issue #210)** — When the stored Google session/cookies were fully expired, `_validate_saved_profile()` raised `ClientAuthenticationError`, which does **not** inherit from `NLMError`. The `except NLMError:` clause in `login_callback` missed it, so the exception bubbled up to `cli_main()` and exited the process before ever launching Chrome for interactive sign-in. Users had to manually delete all profiles as a workaround. Fixed by also catching `ClientAuthenticationError` in the validation catch. Thanks to **@insane66613** for the fix!
+- **MCP silent auth/studio failures (PR #212)** — Three related silent-failure bugs in the MCP server under stale/expired auth:
+    1. `refresh_auth()` returned `status: "success"` after reloading dead tokens from disk. A disk reload is not a successful re-auth — now runs `check_auth(live=True)` after the reload and returns `status: "expired"` with an actionable `nlm login` hint if tokens are dead.
+    2. `studio_create()` had no pre-flight auth check, so it returned `status: "success"` with an `artifact_id` that failed seconds later — sending agents into pointless polling loops. Now runs `check_auth(live=True)` after the network-free confirmation preview and artifact-type validation; invalid auth returns `status: "error"` with an `nlm login` hint before any doomed request is fired.
+    3. `studio_status()` surfaced `status: "failed"` artifacts with every other field `null` and no reason, so callers had no way to know why. The raw gRPC payload carries no error string, so `get_studio_status()` now synthesizes a non-null `error_reason` for failed artifacts while preferring any real `error_reason` / `failure_reason` / `failure_code` / `error` key if a future API version exposes one. 12 new tests cover the full matrix (one is parametrized with 4 cases). Thanks to **@idankatz64-commits** for the comprehensive PR and tests!
+    - The pre-flight `check_auth(live=True)` adds ~1 homepage fetch on the `confirm=True` path of `studio_create` and on every `refresh_auth`. A network-free preview path is preserved for `confirm=False`.
+
+### Changed
+
+- **`ArtifactInfo` gains an optional `error_reason` field** — Returned by the MCP `studio_status` tool. `None` for healthy artifacts; a synthesized string for failed artifacts (with a hint to re-check auth); verbatim from the API if a real `error_reason`/`failure_reason`/`failure_code`/`error` key is present. Backward-compatible: existing callers that only inspect `status` are unaffected.
+- **Bounded in-process conversation history cache (Issue #213)** — The in-process cache of conversation history used to grow without bound, so a long-lived MCP server (typical for an always-on assistant) eventually OOM'd the host. The cache is now bounded by three new env-var knobs (set any to `0` to disable that specific cap):
+    - `NOTEBOOKLM_CONVERSATION_MAX_TURNS` (default `50`) — max turns kept per conversation. Older turns are FIFO-dropped; survivors are renumbered `1..N` so `turn_number` stays a stable 1-indexed position in the current list.
+    - `NOTEBOOKLM_CONVERSATION_MAX_CONVS` (default `500`) — max distinct conversations cached. On overflow, the least-recently-used conversation is evicted. Writes and reads both promote to MRU.
+    - `NOTEBOOKLM_CONVERSATION_MAX_CHARS_PER_TURN` (default `100000`) — per-turn answer character cap as a safety net against pathological payloads. Queries are user input and not truncated.
+    - Public introspection: `get_conversation_cache_stats()` returns `{conversations, total_turns, max_turns_per_conversation, max_conversations, max_chars_per_turn}`.
+    - 13 new tests cover defaults, env-var overrides, invalid-fallback, `0`=unlimited, negative-clamp-to-zero, FIFO trim with renumber, LRU eviction on insert, LRU promotion on read, LRU promotion on write, LRU promotion when migrating to a pre-existing key, answer truncation, stats accuracy, and clear compatibility.
+    - The `--stateless` flag and `NOTEBOOKLM_MCP_STATELESS` env var continue to control the MCP HTTP transport layer only — they do not affect this cache.
+
 ## [0.6.13] - 2026-05-27
 
 ### Security

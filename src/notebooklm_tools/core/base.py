@@ -15,6 +15,7 @@ import random
 import re
 import threading
 import urllib.parse
+from collections import OrderedDict
 from typing import Any
 
 import httpx
@@ -24,7 +25,7 @@ from notebooklm_tools.utils.config import get_base_url
 from . import constants
 from .data_types import ConversationTurn
 from .errors import ClientAuthenticationError as AuthenticationError
-from .errors import ResourceExhaustedError, RPCError
+from .errors import ResourceExhaustedError, RPCDriftError, RPCError
 from .retry import DEFAULT_BASE_DELAY, DEFAULT_MAX_DELAY, DEFAULT_MAX_RETRIES, is_retryable_error
 from .utils import (
     RPC_NAMES,
@@ -36,6 +37,49 @@ from .utils import (
 # Configure logger (API internals only logged at DEBUG level, usually disabled)
 logger = logging.getLogger("notebooklm_mcp.api")
 logger.setLevel(logging.WARNING)  # Suppress internal API logs by default
+
+
+def _safe_int_env(name: str, default: int) -> int:
+    """Read an integer env var, falling back to `default` if missing or unparseable.
+
+    A value of 0 (or negative, clamped here) means "no cap" for cache-size knobs.
+    Negative values are clamped to 0 and logged so a stray `-1` doesn't silently
+    disable a cap the user thought they had set.
+    """
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; falling back to default %d", name, raw, default)
+        return default
+    if value < 0:
+        logger.warning("%s=%d is negative; clamping to 0 (no cap)", name, value)
+        return 0
+    return value
+
+
+def load_rpc_overrides() -> dict[str, str]:
+    """Load runtime RPC-ID overrides from NOTEBOOKLM_RPC_OVERRIDES.
+
+    Lets users hot-patch rotated batchexecute method IDs without a release.
+    The value is a JSON object mapping BaseClient RPC attribute names to new
+    IDs, e.g. '{"RPC_LIST_NOTEBOOKS": "abc123"}'. Returns {} if unset, empty,
+    or malformed (a warning is logged on malformed input).
+    """
+    raw = os.environ.get("NOTEBOOKLM_RPC_OVERRIDES", "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        logger.warning("Ignoring malformed NOTEBOOKLM_RPC_OVERRIDES: %s", e)
+        return {}
+    if not isinstance(data, dict):
+        logger.warning("Ignoring NOTEBOOKLM_RPC_OVERRIDES: expected a JSON object")
+        return {}
+    return {str(k): str(v) for k, v in data.items()}
 
 
 def _extract_user_message(detail_data: Any, _depth: int = 0) -> str:
@@ -315,9 +359,21 @@ class BaseClient:
         self._bl = build_label
         self._created_at: float = _time.time()
 
-        # Conversation cache for follow-up queries
-        # Key: conversation_id, Value: list of ConversationTurn objects
-        self._conversation_cache: dict[str, list[ConversationTurn]] = {}
+        # Conversation cache for follow-up queries.
+        # Key: conversation_id, Value: list of ConversationTurn objects.
+        #
+        # Bounded to prevent unbounded memory growth in long-lived MCP server
+        # processes (Issue #213). The dict itself is an OrderedDict for LRU
+        # eviction; per-conversation turn lists are FIFO-trimmed. See
+        # `_cache_conversation_turn` for the actual caps and eviction logic.
+        self._max_turns_per_conversation = _safe_int_env(
+            "NOTEBOOKLM_CONVERSATION_MAX_TURNS", default=50
+        )
+        self._max_conversations = _safe_int_env("NOTEBOOKLM_CONVERSATION_MAX_CONVS", default=500)
+        self._max_chars_per_turn = _safe_int_env(
+            "NOTEBOOKLM_CONVERSATION_MAX_CHARS_PER_TURN", default=100_000
+        )
+        self._conversation_cache: OrderedDict[str, list[ConversationTurn]] = OrderedDict()
 
         # Request counter for _reqid parameter (required for query endpoint)
         self._reqid_counter = random.randint(100000, 999999)
@@ -336,6 +392,9 @@ class BaseClient:
         # It is never held during network I/O.
         self._state_lock = threading.Lock()
 
+        # Apply any runtime RPC-ID overrides (hot-patch for rotated method IDs).
+        self._apply_rpc_overrides()
+
         # Only refresh CSRF token if not provided - tokens actually last hours/days, not minutes
         # The retry logic in _call_rpc() handles expired tokens gracefully
         if not self.csrf_token:
@@ -352,6 +411,23 @@ class BaseClient:
         if self._client:
             self._client.close()
             self._client = None
+
+    def _apply_rpc_overrides(self) -> None:
+        """Apply NOTEBOOKLM_RPC_OVERRIDES as instance attributes.
+
+        Each entry shadows the matching class-level RPC_* constant on this
+        instance only. Unknown keys (not an existing RPC_* attribute) are
+        logged and ignored so a typo can never silently disable a tool.
+        """
+        for name, new_id in load_rpc_overrides().items():
+            if not name.startswith("RPC_") or not hasattr(type(self), name):
+                logger.warning("Ignoring unknown RPC override: %s", name)
+                continue
+            old_id = getattr(type(self), name)
+            setattr(self, name, new_id)
+            # INFO, not WARNING: an applied override is an intentional, benign
+            # event and should not pollute the warning stream.
+            logger.info("RPC override applied: %s %s -> %s", name, old_id, new_id)
 
     # =========================================================================
     # Cookie Handling
@@ -613,7 +689,30 @@ class BaseClient:
                                 except json.JSONDecodeError:
                                     return result_str
                             return result_str
+        present = self._extract_present_rpc_ids(parsed_response)
+        if present and rpc_id not in present:
+            raise RPCDriftError(rpc_id, present)
         return None
+
+    def _extract_present_rpc_ids(self, parsed_response: list) -> list[str]:
+        """Return the rpc_ids of every wrb.fr chunk in a parsed response.
+
+        Used for drift diagnostics: when the expected rpc_id is missing, this
+        reveals which IDs the server actually returned so the user can set
+        NOTEBOOKLM_RPC_OVERRIDES.
+        """
+        present: list[str] = []
+        for chunk in parsed_response:
+            if isinstance(chunk, list):
+                for item in chunk:
+                    if (
+                        isinstance(item, list)
+                        and len(item) >= 2
+                        and item[0] == "wrb.fr"
+                        and isinstance(item[1], str)
+                    ):
+                        present.append(item[1])
+        return present
 
     def _call_rpc(
         self,
@@ -680,6 +779,8 @@ class BaseClient:
 
             # Check for RPC-level errors (soft auth failure)
             parsed = self._parse_response(response.text)
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("RPC IDs in response: %s", self._extract_present_rpc_ids(parsed))
             result = self._extract_rpc_result(parsed, rpc_id)
 
             # Enhanced debug logging for extracted result
@@ -729,6 +830,31 @@ class BaseClient:
 
             # Fall through to auth recovery below
             pass
+
+        except ResourceExhaustedError:
+            # RPC-level rate limit (HTTP 200, error code 8). Back off and retry.
+            if _server_retry < DEFAULT_MAX_RETRIES:
+                import time as _time
+
+                delay = min(DEFAULT_BASE_DELAY * (2**_server_retry), DEFAULT_MAX_DELAY)
+                logger.warning(
+                    "RPC rate limit (RESOURCE_EXHAUSTED) on %s, attempt %d/%d, retrying in %.1fs...",
+                    rpc_id,
+                    _server_retry + 1,
+                    DEFAULT_MAX_RETRIES + 1,
+                    delay,
+                )
+                _time.sleep(delay)
+                return self._call_rpc(
+                    rpc_id,
+                    params,
+                    path,
+                    timeout,
+                    _retry,
+                    _deep_retry,
+                    _server_retry=_server_retry + 1,
+                )
+            raise
 
         except AuthenticationError:
             # RPC Error 16 - fall through to auth recovery below
@@ -898,11 +1024,13 @@ class BaseClient:
                 self._session_id = ""  # Force re-extraction of session ID
             return True
 
-        # Try headless auth if Chrome profile exists
+        # Try headless auth if the configured default Chrome profile exists.
         try:
-            from notebooklm_tools.utils.cdp import run_headless_auth
+            from notebooklm_tools.utils.auth_browser import run_headless_auth
+            from notebooklm_tools.utils.config import get_config
 
-            tokens = run_headless_auth()
+            profile_name = get_config().auth.default_profile
+            tokens = run_headless_auth(profile_name=profile_name)
             if tokens:
                 with self._state_lock:
                     self.cookies = tokens.cookies

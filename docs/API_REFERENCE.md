@@ -121,6 +121,9 @@ tag(action="select", query="ai research")
 # Check which sources need syncing
 sources = source_list_drive(notebook_id)
 
+# For very large notebooks, skip freshness checks when you only need the source list
+sources = source_list_drive(notebook_id, skip_freshness=True)
+
 # Sync stale sources (after user confirmation)
 source_sync_drive(source_ids=["id1", "id2"], confirm=True)
 ```
@@ -771,7 +774,12 @@ Returns the same structure as `R7cb6c` (Create Studio Content):
 |--------|--------|
 | **Formats** | 1=Deep Dive (conversation), 2=Brief, 3=Critique, 4=Debate |
 | **Lengths** | 1=Short, 2=Default, 3=Long |
-| **Languages** | BCP-47 codes: "en", "es", "fr", "de", "ja", etc. |
+| **Languages** | BCP-47 codes, including regional values such as `"es-ES"`, `"es-US"`, and `"es-419"` |
+
+For Audio Overviews, NotebookLM has been observed using the region subtag to
+select the voice accent. `es` and `es-ES` produce Spain Spanish, while `es-US`
+and `es-419` produce Latin-American Spanish. Prompt text does not reliably
+override the accent. This is observed behavior and may change upstream.
 
 ### Video Options
 
@@ -1397,6 +1405,9 @@ NotebookLM doesn't auto-update Google Drive sources when the underlying document
 
 ### Solution
 The `source_list_drive` and `source_sync_drive` tools automate this process.
+For very large notebooks, `source_list_drive(notebook_id, skip_freshness=True)` skips
+the per-source freshness RPCs and returns the source list faster, with stale status
+reported as unknown.
 
 ### Source Metadata Structure (from `rLM1Ne` response)
 

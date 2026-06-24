@@ -11,6 +11,9 @@ Tested with personal/free tier accounts. May work with Google Workspace accounts
 ## Development Commands
 
 ```bash
+# Fetch latest from remote (run before git operations)
+git fetch
+
 # Install dependencies
 uv tool install .
 
@@ -75,6 +78,16 @@ save_auth_tokens(cookies=<cookie_header>)
 | `NOTEBOOKLM_SESSION_ID` | No | (DEPRECATED - auto-extracted) |
 | `NOTEBOOKLM_BL` | No | Override for build label / bl URL param (auto-extracted from page) |
 | `NOTEBOOKLM_HL` | No | Interface language and default artifact language (default: `en`) |
+| `NOTEBOOKLM_RPC_OVERRIDES` | No | Hot-patch rotated batchexecute RPC method IDs without a release. JSON object mapping `BaseClient` RPC attribute names to new IDs, e.g. `{"RPC_LIST_NOTEBOOKS": "abc123"}` |
+
+### Resilience: rotated RPC IDs
+
+NotebookLM's internal API uses short RPC "method IDs" (e.g. `wXbhsf`) that Google rotates without notice. When one rotates, calls using the old ID fail. The client now:
+
+- **Detects drift loudly**: raises `RPCDriftError` (instead of returning silently) when the server responds with **other** `wrb.fr` RPC IDs than the one requested. An empty response still returns silently (no comparison points), so use `--debug` to inspect in that case.
+- **Discovers the new ID**: run with `--debug` to log `RPC IDs in response: [...]` — the new ID for your call appears there.
+- **Hot-patches without a release**: set `NOTEBOOKLM_RPC_OVERRIDES='{"RPC_LIST_NOTEBOOKS": "<new_id>"}'` (use the `RPC_*` attribute name from `core/base.py`) to override the ID for the current session. **Restart the MCP server for the override to take effect** — the env var is read once at client init, not per call. The CLI (`nlm`) picks it up on the next invocation automatically.
+- **Auto-retries throttling**: `RESOURCE_EXHAUSTED` (RPC error code 8) responses are retried with exponential backoff.
 
 ### Token Expiration
 
@@ -142,7 +155,8 @@ src/notebooklm_tools/
 | `notebook_get` | Get notebook details |
 | `notebook_describe` | Get AI-generated summary of notebook content with keywords |
 | `source_describe` | Get AI-generated summary and keyword chips for a source |
-| `source_get_content` | Get raw text content from a source (no AI processing) |
+| `source_get_content` | Get raw text content from a source (no AI processing). Supports `wait`, `wait_timeout`, `poll_interval` params and returns `download_url` when MCP HTTP transport is active. |
+| `source_add_chatgpt_file` | Add a ChatGPT-uploaded file to a notebook (supports `openai/fileParams`). Supports `wait`, `wait_timeout`, `cleanup` params. |
 | `notebook_rename` | Rename a notebook |
 | `chat_configure` | Configure chat goal/style and response length |
 | `notebook_delete` | Delete a notebook (REQUIRES confirmation) |
@@ -153,10 +167,10 @@ src/notebooklm_tools/
 | `source_rename` | Rename a source in a notebook |
 | `source_delete` | Delete a source from notebook (REQUIRES confirmation) |
 | `research_start` | Start Web or Drive research to discover sources |
-| `research_status` | Check research progress and get results |
-| `research_import` | Import discovered sources into notebook |
+| `research_status` | Check research progress (default: 900s wait, 30s poll). Pass `auto_import=True` to automatically import sources on completion — no separate `research_import` call needed. |
+| `research_import` | Import discovered sources into notebook (manual, if `auto_import` not used) |
 | `studio_create` | Generate unified content (audio, video, infographic, slides, etc.) |
-| `download_artifact` | Download any artifact (audio, video, pdf, markdown, json) |
+| `download_artifact` | Download any artifact (audio, video, pdf, markdown, json). Supports `wait`, `wait_timeout`, `poll_interval` params and returns `download_url` when MCP HTTP transport is active. |
 | `export_artifact` | Export Data Tables to Google Sheets or Reports to Google Docs |
 | `studio_status` | Check studio artifact generation status |
 | `studio_delete` | Delete studio artifacts (REQUIRES confirmation) |
@@ -254,6 +268,14 @@ When adding new features:
 7. Write unit tests for the service function in `tests/services/`
 8. Update the "Features NOT Yet Implemented" checklist
 9. Add test case to docs/MCP_TEST_PLAN.md
+
+**Bumping the version:** the `Version Alignment Check` workflow (`.github/workflows/version-check.yml`) requires the **same** version in all 5 of these files — bump them together or CI fails:
+
+- `pyproject.toml` → `version = "X.Y.Z"`
+- `src/notebooklm_tools/__init__.py` → `__version__ = "X.Y.Z"`
+- `src/notebooklm_tools/data/SKILL.md` → `version: "X.Y.Z"`
+- `src/notebooklm_tools/data/AGENTS_SECTION.md` → `<!-- nlm-version: X.Y.Z -->`
+- `desktop-extension/manifest.json` → `"version": "X.Y.Z"`
 
 ## License
 

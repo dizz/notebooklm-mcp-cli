@@ -37,23 +37,40 @@ def refresh_auth() -> ResultDict:
             )
 
         # Try reloading from disk first
-        from notebooklm_tools.core.auth import load_cached_tokens
+        from notebooklm_tools.services.auth import load_cached_tokens
 
         cached = load_cached_tokens()
         if cached:
-            # Reset client to force re-initialization with fresh tokens
+            # Honesty check FIRST: reloading tokens from disk is NOT a successful
+            # re-auth if those tokens are already dead. Validate live before
+            # creating any client, otherwise agents loop on doomed studio calls
+            # (and we leave a client object initialized with bad tokens behind).
+            from notebooklm_tools.services.auth import credentials_are_usable
+
+            usable, status, detail = credentials_are_usable(force=True)
+            if not usable:
+                return error_result(
+                    "Auth tokens were reloaded from disk but are no longer valid "
+                    f"(reason: {status}). A disk reload cannot revive expired "
+                    "credentials — run `nlm login` in a terminal to re-authenticate.",
+                    status="expired",
+                    reason=status,
+                    details=detail,
+                )
             reset_client()
-            get_client()  # This will use the cached tokens
+            get_client()
             return {
                 "status": "success",
-                "message": "Auth tokens reloaded from disk cache.",
+                "message": "Auth tokens reloaded from disk cache and validated.",
             }
 
-        # Try headless auth if Chrome profile exists
+        # Try headless auth if the configured default Chrome profile exists
         try:
-            from notebooklm_tools.utils.cdp import run_headless_auth
+            from notebooklm_tools.utils.auth_browser import run_headless_auth
+            from notebooklm_tools.utils.config import get_config
 
-            tokens = run_headless_auth()
+            profile_name = get_config().auth.default_profile
+            tokens = run_headless_auth(profile_name=profile_name)
             if tokens:
                 reset_client()
                 get_client()
@@ -94,7 +111,11 @@ def save_auth_tokens(
         request_url: Optional - contains session ID if extracting manually
     """
     try:
-        from notebooklm_tools.core.auth import AuthTokens, get_cache_path, save_tokens_to_cache
+        from notebooklm_tools.services.auth import (
+            AuthTokens,
+            get_cache_path,
+            save_tokens_to_cache,
+        )
 
         # Parse cookie string to dict
         all_cookies = {}

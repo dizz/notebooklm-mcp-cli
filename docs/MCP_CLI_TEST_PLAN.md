@@ -2,10 +2,10 @@
 
 **Purpose:** Verify all **30 consolidated MCP tools** work correctly.
 
-**Version:** 2.3 (Updated 2026-02-21 - added studio_revise)
+**Version:** 2.4 (Updated 2026-06-20 - synchronized current MCP surface)
 
 **Changes from v2.1:**
-- Corrected tool count: 29 tools (notes consolidated + server_info added)
+- Current tool count: 39 tools (including consolidated notes, labels, async query, batch, pipeline, tags, and server_info)
 
 **Changes from v1:**
 - Tools consolidated: 45+ → 29 (-36%)
@@ -188,6 +188,7 @@ Add a file to notebook [notebook_id]:
 ### Test 2.5 - List Sources with Drive Status
 **Tool:** `source_list_drive`
 **CLI:** `nlm source list [notebook_id] --drive`
+**CLI (fast list):** `nlm source list [notebook_id] --drive --skip-freshness`
 
 **Prompt:**
 ```
@@ -195,6 +196,10 @@ List all sources in notebook [notebook_id] and check their Drive freshness statu
 ```
 
 **Expected:** List showing sources by type, Drive sources show freshness.
+
+**Large notebook variant:** Call `source_list_drive` with `skip_freshness=True`, or use
+`nlm source list [notebook_id] --drive --skip-freshness`. Expected: sources are listed
+without per-source freshness checks; stale status may be unknown.
 
 **Save:** Note a `source_id` for next tests.
 

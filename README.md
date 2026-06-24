@@ -7,8 +7,7 @@
 [![Total downloads](https://static.pepy.tech/badge/notebooklm-mcp-cli)](https://pepy.tech/projects/notebooklm-mcp-cli)
 [![Python](https://img.shields.io/pypi/pyversions/notebooklm-mcp-cli)](https://pypi.org/project/notebooklm-mcp-cli/)
 [![License](https://img.shields.io/pypi/l/notebooklm-mcp-cli)](https://github.com/jacob-bd/notebooklm-mcp-cli/blob/main/LICENSE)
-
-> 🎉 **January 2026 — Major Update!** This project has been completely refactored to unify **NotebookLM-MCP** and **NotebookLM-CLI** into a single, powerful package. One install gives you both the CLI (`nlm`) and MCP server (`notebooklm-mcp`). See the [CLI Guide](docs/CLI_GUIDE.md) and [MCP Guide](docs/MCP_GUIDE.md) for full documentation.
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-FFDD00?style=flat-square&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/jacobbd)
 
 **Programmatic access to Google NotebookLM** — via command-line interface (CLI) or Model Context Protocol (MCP) server.
 
@@ -94,9 +93,11 @@ Then use natural language: *"Create a notebook about quantum computing and gener
 | Diagnose issues | `nlm doctor` | — |
 
 📚 **More Documentation:**
+- **[Getting Started](docs/GETTING_STARTED.md)** — Install, login, agent setup, and migration from another NotebookLM MCP
 - **[CLI Guide](docs/CLI_GUIDE.md)** — Complete command reference
 - **[MCP Guide](docs/MCP_GUIDE.md)** — All 35 MCP tools with examples
 - **[Authentication](docs/AUTHENTICATION.md)** — Setup and troubleshooting
+- **[Remote MCP](docs/REMOTE_MCP.md)** — Web/mobile connector feasibility, security, and authentication limitations
 - **[API Reference](docs/API_REFERENCE.md)** — Internal API docs for contributors
 
 ## Important Disclaimer
@@ -229,6 +230,14 @@ nlm login
 
 > **Note:** MCP server configuration (in Claude Code, Cursor, etc.) does not need to change — the executable name `notebooklm-mcp` is the same.
 
+## Getting Started
+
+If you are setting up the tool for the first time — or migrating from a
+browser-based NotebookLM MCP — see the
+[Getting Started Guide](docs/GETTING_STARTED.md). It covers install,
+login, agent registration, and a step-by-step migration path that avoids
+the "two NotebookLM servers registered" trap.
+
 ## Uninstalling
 
 To completely remove the MCP:
@@ -307,7 +316,7 @@ For detailed instructions and troubleshooting, see **[docs/AUTHENTICATION.md](do
 
 ## MCP Configuration
 
-> **⚠️ Context Window Warning:** This MCP provides **35 tools**. Disable it when not using NotebookLM to preserve context. In Claude Code: `@notebooklm-mcp` to toggle.
+> **⚠️ Context Window Warning:** This MCP provides **39 tools**. Disable it when not using NotebookLM to preserve context. In Claude Code: `@notebooklm-mcp` to toggle.
 
 ### Automatic Setup (Recommended)
 
@@ -434,7 +443,7 @@ Find your path with: `which notebooklm-mcp`
 
 </details>
 
-📚 **Full configuration details:** [MCP Guide](docs/MCP_GUIDE.md) — Server options, environment variables, HTTP transport, multi-user setup, and context window management.
+📚 **Full configuration details:** [MCP Guide](docs/MCP_GUIDE.md) — Server options, environment variables, HTTP transport, and context window management. For Claude web/mobile and public deployment, read [Remote MCP Deployment](docs/REMOTE_MCP.md) first.
 
 ## What You Can Do
 
@@ -564,6 +573,15 @@ Special thanks to:
 - **codepiano** ([@codepiano](https://github.com/codepiano)) for the configurable DevTools timeout for the auth CLI.
 - **Tony Hansmann** ([@997unix](https://github.com/997unix)) for contributing the `nlm setup` and `nlm doctor` commands and CLI Guide documentation.
 - **Fabiana Furtado** ([@fabianafurtadoff](https://github.com/fabianafurtadoff)) for batch operations, cross-notebook query, pipelines, and smart select/tagging (PR #90).
+- **Amy-Ra-lph** ([@Amy-Ra-lph](https://github.com/Amy-Ra-lph)) for security hardening: TOCTOU-safe credential storage, sensitive cookie redaction from debug logs, and pinning all CI actions to full commit SHAs (PRs #205–207).
+- **Kyle Brodeur** ([@kylebrodeur](https://github.com/kylebrodeur)) for WSL2 authentication support with Windows Chrome integration (PR #138).
+- **Robiton** ([@Robiton](https://github.com/Robiton)) for enterprise NotebookLM support via configurable base URL (PR #114).
+- **pjeby** ([@pjeby](https://github.com/pjeby)) for connection pooling and fast startup improvements (PR #54).
+- **beausea** ([@beausea](https://github.com/beausea)) for making the interface language configurable via the `NOTEBOOKLM_HL` environment variable (PR #59).
+- **JumpLao** ([@JumpLao](https://github.com/JumpLao)) for extended audio, video, and image format support (PR #82).
+- **cbruyndoncx** ([@cbruyndoncx](https://github.com/cbruyndoncx)) for including `cited_text` passages in query output (PR #81).
+- **zxyasfas** ([@zxyasfas](https://github.com/zxyasfas)) for cited-only research import (PR #188).
+- **Serdar Akın** ([@SERDAR-AKIN](https://github.com/SERDAR-AKIN)) for the multi-probe `AuthHealthChecker` that fixes false `"stale"` reports for semi-stale cookies (PR #219).
 
 
 ## Star History
